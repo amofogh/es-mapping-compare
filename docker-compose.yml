@@ -1,0 +1,42 @@
+# Shared settings for one-shot jobs (same image for both steps)
+x-app: &app
+  build: .
+  image: es-mapping-tools:latest
+  pull_policy: build
+  restart: "no"
+  # Run as root so bind mounts are always writable; entrypoint chowns
+  # outputs back to the host user when HOST_UID/HOST_GID are set:
+  #   HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose up
+  env_file:
+    - .env
+  environment:
+    ENABLE_BETA: ${ENABLE_BETA:-false}
+    ES_VERIFY_CERTS: ${ES_VERIFY_CERTS:-false}
+    DISCOVER_CLUSTER: ${DISCOVER_CLUSTER:-stage}
+    # Optional: mic | mic,cd | mic-api,mic-ava  (empty = all)
+    PREFIX_FILTER: ${PREFIX_FILTER:-}
+    HOST_UID: ${HOST_UID:-}
+    HOST_GID: ${HOST_GID:-}
+  volumes:
+    - ./results:/app/results
+    - ./prefixes.json:/app/prefixes.json
+    - ./.env:/app/.env:ro
+  # Reach internal Elasticsearch hostnames like on the host (Linux).
+  network_mode: host
+  entrypoint: ["/docker-entrypoint.sh"]
+
+services:
+  # Step 1: scan ES and merge service prefixes into prefixes.json
+  discover-prefixes:
+    <<: *app
+    container_name: es-discover-prefixes
+    command: ["discover"]
+
+  # Step 2: mapping analysis only (after discover finishes successfully)
+  es-mapping-compare:
+    <<: *app
+    container_name: es-mapping-compare
+    command: ["compare"]
+    depends_on:
+      discover-prefixes:
+        condition: service_completed_successfully

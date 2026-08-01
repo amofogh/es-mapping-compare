@@ -1,0 +1,29 @@
+{
+  "core_domain_prefixes": [
+    "mic"
+  ],
+  "service_prefixes": [
+    "mic-api",
+    "mic-ava",
+    "mic-avaplatform-ats-api",
+    "mic-avaplatform-ava-api",
+    "mic-avaplatform-job-api",
+    "mic-avaplatform-push-api",
+    "mic-avaplatform-servicegateway-api",
+    "mic-avaplatform-webgateway-api",
+    "mic-iss.coreapi",
+    "mic-iss.externalapi",
+    "mic-iss.happycall",
+    "mic-iss.hub",
+    "mic-iss.internalapi",
+    "mic-iss.jobs",
+    "mic-iss.notification",
+    "mic-iss.webapi",
+    "mic-myagah",
+    "mic-oauth",
+    "mic-push",
+    "mic-segmentlogs",
+    "mic-stage-research",
+    "mic-staging-myagah"
+  ]
+}
