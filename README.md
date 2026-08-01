@@ -162,6 +162,24 @@ Used in `results/central_format_readiness.csv` / YAML metadata for Fluentd plann
 
 `core_team` is the root namespace before the first hyphen (e.g. `cd-express` → `cd`).
 
+## ECS score (`ecs_score` / `ecs_ready`)
+
+In YAML (`results/index_mappings/<prefix>.yaml`) and the CLI summary, each Stage/Beta index gets an ECS readiness score.
+
+**`ecs_score: N/5`** means **N of 5 core ECS fields** are present in that index’s mapping:
+
+| # | Required ECS field | Common legacy substitutes (do **not** count toward the score) |
+|---|--------------------|----------------------------------------------------------------|
+| 1 | `@timestamp` | `time`, `timestamp`, `date` |
+| 2 | `log.level` | `level`, `Level`, `severity`, `log_level` |
+| 3 | `message` | `msg`, `MessageTemplate`, `log` |
+| 4 | `service.name` | `service`, `application`, `Properties.Application` |
+| 5 | `host.name` | `hostname`, `host`, `MachineName` |
+
+- **`ecs_ready: true`** only when the score is **5/5** (all five ECS field names present).
+- **`ecs_score: 1/5`** usually means only `@timestamp` exists (typical Format 3 / legacy worker logs).
+- Legacy field names may still help classify **Format 2** (light Fluentd mutate), but they do not raise `ecs_score` until renamed/mapped to the ECS paths above.
+
 ## Feature toggle: `ENABLE_BETA`
 
 | Value | Behavior |
