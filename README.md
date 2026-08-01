@@ -37,9 +37,9 @@ All generated files go under **`results/`** (not the project root):
 | `results/mapping_comparison.json` | Full machine-readable report |
 | `results/all_index_mappings.csv` | One row per field (`project_prefix`, `field_name`, Stage type, ECS flag) |
 | `results/central_format_readiness.csv` | Per-service summary + `core_team` + `target_log_format` |
-| `results/index_field_counts.csv` | Per-service field counts |
-| `results/all_index_mappings.yaml` | All services’ fields in one YAML file |
-| `results/index_mappings/<prefix>.yaml` | One YAML file per service (easy to read) |
+| `results/index_field_counts.csv` | Per-service Stage vs Beta: docs, index size, avg log size (no duplicate columns) |
+| `results/all_index_mappings.yaml` | All services in one YAML (Stage/Beta blocks + ES field types + diffs) |
+| `results/index_mappings/<prefix>.yaml` | One YAML file per service |
 
 ## Prerequisites
 
@@ -113,6 +113,10 @@ python discover_prefixes.py --dry-run    # print only, do not write
 
 Edit this file to remove noise or pin a curated subset before comparing.
 
+Optional ``beta_prefix_aliases`` maps Stage service names to Beta stream
+names when naming differs (e.g. Stage ``mic-ava`` → Beta ``mic-beta-ava``,
+or many ``mic-iss.*`` → one ``mic-beta-iss``).
+
 ### 3) Run mapping analysis
 
 **Stage-only (recommended default):**
@@ -169,6 +173,8 @@ Used in `results/central_format_readiness.csv` / YAML metadata for Fluentd plann
 
 - Field counts can **grow during the day** on dynamically mapped indices (new document shapes add fields). Two runs of the same daily index can differ.
 - `field_count` counts **primary** mapped fields only. Elasticsearch multi-fields such as `message.keyword` are **excluded** (they are index helpers, not separate log fields).
+- `index_size` / `index_size_bytes` are the resolved **daily index** store size (from `_stats`).
+- `avg_log_size` ≈ `index_size_bytes / docs_count` (average compressed document size on disk; empty when the index has 0 docs).
 - Exit code `2` means schema drift / type mismatches were detected (useful in CI). Exit `0` means clean for the configured mode.
 
 ## Run with Docker (one-shot pipeline)

@@ -179,6 +179,70 @@ def load_core_domain_prefixes(path: Optional[Path] = None) -> List[str]:
     return sorted(set(domains)) or ["ams", "ats", "cd", "ecs", "hrm", "ime", "mic", "oms"]
 
 
+def load_beta_prefix_aliases(path: Optional[Path] = None) -> Dict[str, str]:
+    """
+    Load Stage→Beta service prefix aliases from prefixes.json.
+
+    Beta often uses ``<team>-beta-<app>`` (e.g. ``mic-beta-ava``) while Stage
+    uses ``<team>-<app>`` (``mic-ava``), and may consolidate many Stage
+    services into one Beta stream (all ``mic-iss.*`` → ``mic-beta-iss``).
+    """
+    prefixes_path = path or PREFIXES_FILE
+    if not prefixes_path.is_file():
+        return {}
+    try:
+        with open(prefixes_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    raw = data.get("beta_prefix_aliases") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(k).strip(): str(v).strip()
+        for k, v in raw.items()
+        if str(k).strip() and str(v).strip()
+    }
+
+
+def beta_prefix_candidates(
+    stage_prefix: str,
+    aliases: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """
+    Ordered Beta lookup prefixes for a Stage service prefix.
+
+    1. Explicit alias from ``beta_prefix_aliases``
+    2. Auto ``team-beta-rest`` (mic-ava → mic-beta-ava)
+    3. Collapsed ``team-beta-head`` (mic-iss.webapi → mic-beta-iss)
+    4. Exact Stage name (in case naming matches)
+    """
+    aliases = aliases if aliases is not None else load_beta_prefix_aliases()
+    prefix = (stage_prefix or "").strip()
+    if not prefix:
+        return []
+
+    ordered: List[str] = []
+
+    def _add(name: str) -> None:
+        name = name.strip()
+        if name and name not in ordered:
+            ordered.append(name)
+
+    if prefix in aliases:
+        _add(aliases[prefix])
+
+    if "-" in prefix:
+        team, rest = prefix.split("-", 1)
+        _add(f"{team}-beta-{rest}")
+        head = rest.replace(".", "-").split("-", 1)[0]
+        if head:
+            _add(f"{team}-beta-{head}")
+
+    _add(prefix)
+    return ordered
+
+
 def core_team_of(prefix: str) -> str:
     """Derive root team namespace from a service prefix (e.g. cd-express -> cd)."""
     if not prefix:
@@ -573,6 +637,31 @@ def resolve_latest_index(
     return None
 
 
+def resolve_latest_index_beta(
+    es: Elasticsearch,
+    stage_prefix: str,
+    aliases: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve Beta index for a Stage service prefix.
+
+    Tries alias / ``team-beta-*`` candidates. Returns
+    ``(resolved_index, beta_prefix_used)``.
+    """
+    for candidate in beta_prefix_candidates(stage_prefix, aliases=aliases):
+        resolved = resolve_latest_index(es, candidate, cluster_label="Beta")
+        if resolved:
+            if candidate != stage_prefix:
+                logger.info(
+                    "Prefix '%s': Beta alias '%s' -> %s",
+                    stage_prefix,
+                    candidate,
+                    resolved,
+                )
+            return resolved, candidate
+    return None, None
+
+
 def _resolve_from_wildcard(
     es: Elasticsearch,
     prefix: str,
@@ -777,6 +866,130 @@ def fetch_flattened_mapping(
     )
 
 
+def human_bytes(num_bytes: Optional[int]) -> Optional[str]:
+    """Format byte counts as compact human strings (e.g. ``1.2mb``)."""
+    if num_bytes is None:
+        return None
+    try:
+        n = float(num_bytes)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        n = 0.0
+    units = ("b", "kb", "mb", "gb", "tb", "pb")
+    idx = 0
+    while n >= 1024.0 and idx < len(units) - 1:
+        n /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(n)}{units[idx]}"
+    return f"{n:.1f}{units[idx]}"
+
+
+def empty_index_size_stats() -> Dict[str, Any]:
+    return {
+        "docs_count": 0,
+        "store_size_bytes": 0,
+        "pri_store_size_bytes": 0,
+        "avg_log_size_bytes": None,
+        "store_size": "0b",
+        "avg_log_size": None,
+    }
+
+
+def fetch_index_size_stats(
+    es: Elasticsearch,
+    index_name: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Index (daily) store size + average log/document size.
+
+    Uses primary+replica ``store.size`` and ``docs.count`` from ``_stats``.
+    ``avg_log_size_bytes`` ≈ store_size_bytes / docs_count (None if no docs).
+    """
+    stats = empty_index_size_stats()
+    if not index_name or index_name in {"DISABLED", "MISSING"}:
+        return stats
+
+    try:
+        resp = es.indices.stats(index=index_name, metric="store,docs")
+    except NotFoundError:
+        return stats
+    except TransportError as exc:
+        if getattr(exc, "status_code", None) == 404:
+            return stats
+        logger.warning(
+            "Failed to fetch size stats for %s: %s",
+            index_name,
+            _explain_transport_error(exc),
+        )
+        return stats
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to fetch size stats for %s: %s", index_name, exc)
+        return stats
+
+    indices = (resp or {}).get("indices") or {}
+    # Prefer exact name; fall back to the single returned index if aliased.
+    body = indices.get(index_name)
+    if body is None and len(indices) == 1:
+        body = next(iter(indices.values()))
+    if not isinstance(body, dict):
+        # Aggregate totals as last resort
+        total = ((resp or {}).get("_all") or {}).get("total") or {}
+        docs_count = int(((total.get("docs") or {}).get("count")) or 0)
+        store_bytes = int(((total.get("store") or {}).get("size_in_bytes")) or 0)
+        pri_bytes = int(
+            ((((resp or {}).get("_all") or {}).get("primaries") or {})
+             .get("store") or {})
+            .get("size_in_bytes")
+            or 0
+        )
+    else:
+        total = body.get("total") or {}
+        primaries = body.get("primaries") or {}
+        docs_count = int(((total.get("docs") or {}).get("count")) or 0)
+        store_bytes = int(((total.get("store") or {}).get("size_in_bytes")) or 0)
+        pri_bytes = int(((primaries.get("store") or {}).get("size_in_bytes")) or 0)
+
+    avg: Optional[int] = None
+    if docs_count > 0:
+        avg = int(round(store_bytes / docs_count))
+
+    return {
+        "docs_count": docs_count,
+        "store_size_bytes": store_bytes,
+        "pri_store_size_bytes": pri_bytes,
+        "avg_log_size_bytes": avg,
+        "store_size": human_bytes(store_bytes) or "0b",
+        "avg_log_size": human_bytes(avg),
+    }
+
+
+def attach_index_size_stats(
+    entry: Dict[str, Any],
+    beta: Optional[Elasticsearch],
+    stage: Elasticsearch,
+    beta_enabled: bool,
+) -> None:
+    """Populate ``stage_size`` / ``beta_size`` on a compare result entry."""
+    stage_index = entry.get("stage_index")
+    entry["stage_size"] = (
+        fetch_index_size_stats(stage, stage_index)
+        if stage_index
+        else empty_index_size_stats()
+    )
+
+    if not beta_enabled or beta is None:
+        entry["beta_size"] = empty_index_size_stats()
+        return
+
+    beta_index = entry.get("beta_index")
+    if beta_index and beta_index != "DISABLED":
+        entry["beta_size"] = fetch_index_size_stats(beta, beta_index)
+    else:
+        entry["beta_size"] = empty_index_size_stats()
+
+
 # ---------------------------------------------------------------------------
 # Comparison & ECS checks
 # ---------------------------------------------------------------------------
@@ -862,11 +1075,13 @@ def compare_clusters(
     prefixes = prefixes or CORE_INDEX_PREFIXES
     beta_enabled = ENABLE_BETA if enable_beta is None else enable_beta
     results: List[Dict[str, Any]] = []
+    beta_aliases = load_beta_prefix_aliases() if beta_enabled else {}
 
     for prefix in prefixes:
         entry: Dict[str, Any] = {
             "prefix": prefix,
             "beta_index": "DISABLED" if not beta_enabled else None,
+            "beta_prefix": None,
             "stage_index": None,
             "status": "ok",
             "error": None,
@@ -877,24 +1092,32 @@ def compare_clusters(
             "beta_fields": {},
             "stage_fields": {},
             "beta_disabled": not beta_enabled,
+            "stage_size": empty_index_size_stats(),
+            "beta_size": empty_index_size_stats(),
         }
 
         try:
+            beta_prefix_used: Optional[str] = None
             if beta_enabled:
                 if beta is None:
                     raise RuntimeError("ENABLE_BETA is True but Beta client is None")
-                beta_index = resolve_latest_index(beta, prefix, cluster_label="Beta")
+                beta_index, beta_prefix_used = resolve_latest_index_beta(
+                    beta, prefix, aliases=beta_aliases
+                )
             else:
                 beta_index = "DISABLED"
 
             stage_index = resolve_latest_index(stage, prefix, cluster_label="Stage")
             entry["beta_index"] = beta_index
+            entry["beta_prefix"] = beta_prefix_used
             entry["stage_index"] = stage_index
 
             if beta_enabled and not beta_index:
+                tried = ", ".join(beta_prefix_candidates(prefix, beta_aliases))
                 logger.warning(
-                    "Prefix '%s': MISSING on Beta — CSV will use MISSING/N/A for Beta",
+                    "Prefix '%s': MISSING on Beta (tried: %s) — CSV will use MISSING/N/A for Beta",
                     prefix,
+                    tried,
                 )
             if not stage_index:
                 logger.warning(
@@ -924,6 +1147,7 @@ def compare_clusters(
                         "beta": None,
                         "stage": check_ecs_compliance(stage_fields) if stage_fields else None,
                     }
+                    attach_index_size_stats(entry, beta, stage, beta_enabled)
                     results.append(entry)
                     continue
 
@@ -941,6 +1165,7 @@ def compare_clusters(
                 }
                 entry["has_type_mismatch"] = False
                 entry["has_schema_drift"] = False
+                attach_index_size_stats(entry, beta, stage, beta_enabled)
                 results.append(entry)
                 continue
 
@@ -948,12 +1173,16 @@ def compare_clusters(
                 entry["status"] = "missing_both"
                 entry["error"] = f"No index matching '{prefix}-*' on Beta or Stage"
                 entry["has_schema_drift"] = True
+                attach_index_size_stats(entry, beta, stage, beta_enabled)
                 results.append(entry)
                 continue
 
             if not beta_index:
+                tried = ", ".join(beta_prefix_candidates(prefix, beta_aliases))
                 entry["status"] = "missing_beta"
-                entry["error"] = f"No index matching '{prefix}-*' on Beta"
+                entry["error"] = (
+                    f"No Beta index for '{prefix}' (tried: {tried})"
+                )
                 entry["has_schema_drift"] = True
             elif not stage_index:
                 entry["status"] = "missing_stage"
@@ -981,6 +1210,7 @@ def compare_clusters(
             entry["has_schema_drift"] = True
             logger.exception("Prefix '%s' failed: %s", prefix, exc)
 
+        attach_index_size_stats(entry, beta, stage, beta_enabled)
         results.append(entry)
 
     drifted = [r for r in results if r.get("has_schema_drift")]
@@ -1021,6 +1251,17 @@ def compare_clusters(
 
 def _bool_csv(value: bool) -> str:
     return "TRUE" if value else "FALSE"
+
+
+def _primary_size_stats(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Prefer Stage size stats; fall back to Beta."""
+    stage_size = entry.get("stage_size") or empty_index_size_stats()
+    if entry.get("stage_index") not in (None, "MISSING"):
+        return stage_size
+    beta_size = entry.get("beta_size") or empty_index_size_stats()
+    if entry.get("beta_index") not in (None, "MISSING", "DISABLED"):
+        return beta_size
+    return stage_size
 
 
 def export_mappings_to_csv(
@@ -1129,6 +1370,12 @@ def export_central_format_readiness_csv(
         "ecs_compliant_fields_count",
         "can_centralize_as_is",
         "target_log_format",
+        "stage_docs",
+        "stage_index_size",
+        "stage_avg_log_size",
+        "beta_docs",
+        "beta_index_size",
+        "beta_avg_log_size",
     ]
 
     beta_enabled = bool(report.get("enable_beta", ENABLE_BETA))
@@ -1192,6 +1439,8 @@ def export_central_format_readiness_csv(
                 and core_ecs_ok
             )
 
+        stage_size = entry.get("stage_size") or empty_index_size_stats()
+        beta_size = entry.get("beta_size") or empty_index_size_stats()
         rows.append(
             {
                 "project_prefix": prefix,
@@ -1203,6 +1452,18 @@ def export_central_format_readiness_csv(
                 "ecs_compliant_fields_count": ecs_compliant,
                 "can_centralize_as_is": _bool_csv(can_centralize),
                 "target_log_format": target_log_format,
+                "stage_docs": stage_size.get("docs_count", 0),
+                "stage_index_size": stage_size.get("store_size") or "0b",
+                "stage_avg_log_size": stage_size.get("avg_log_size") or "",
+                "beta_docs": ""
+                if beta_disabled
+                else beta_size.get("docs_count", 0),
+                "beta_index_size": ""
+                if beta_disabled
+                else (beta_size.get("store_size") or "0b"),
+                "beta_avg_log_size": ""
+                if beta_disabled
+                else (beta_size.get("avg_log_size") or ""),
             }
         )
 
@@ -1222,20 +1483,26 @@ def export_index_field_counts_csv(
     csv_path: str = FIELD_COUNTS_CSV_FILE,
 ) -> str:
     """
-    Simple per-index field-count summary::
+    Per-service summary: Stage vs Beta index size and field counts.
 
-        project_prefix,resolved_index,field_count,stage_field_count,beta_field_count,target_log_format
+    Human-readable sizes only (no duplicate primary/stage columns, no raw bytes).
     """
     fieldnames = [
-        "project_prefix",
-        "core_team",
-        "resolved_index",
-        "field_count",
+        "service",
+        "team",
+        "log_format",
         "stage_index",
-        "stage_field_count",
+        "stage_fields",
+        "stage_docs",
+        "stage_index_size",
+        "stage_avg_log_size",
         "beta_index",
-        "beta_field_count",
-        "target_log_format",
+        "beta_prefix",
+        "beta_fields",
+        "beta_docs",
+        "beta_index_size",
+        "beta_avg_log_size",
+        "beta_status",
     ]
 
     beta_enabled = bool(report.get("enable_beta", ENABLE_BETA))
@@ -1249,40 +1516,76 @@ def export_index_field_counts_csv(
         beta_fields: Dict[str, str] = {} if beta_disabled else (entry.get("beta_fields") or {})
         stage_fields: Dict[str, str] = entry.get("stage_fields") or {}
 
-        stage_index = entry.get("stage_index") or "MISSING"
-        beta_index = "DISABLED" if beta_disabled else (entry.get("beta_index") or "MISSING")
+        stage_index = entry.get("stage_index") or ""
+        beta_index = entry.get("beta_index") or ""
+        stage_size = entry.get("stage_size") or empty_index_size_stats()
+        beta_size = (
+            empty_index_size_stats()
+            if beta_disabled
+            else (entry.get("beta_size") or empty_index_size_stats())
+        )
 
-        # Primary count/index: Stage when present, else Beta.
-        if stage_fields or (stage_index not in (None, "MISSING")):
-            resolved_index = stage_index
-            field_count = len(stage_fields)
-        elif beta_fields:
-            resolved_index = beta_index
-            field_count = len(beta_fields)
+        if beta_disabled:
+            beta_status = "disabled"
+            beta_index_out = "DISABLED"
+            beta_prefix_out = ""
+            beta_fields_n = ""
+            beta_docs = ""
+            beta_index_size = ""
+            beta_avg = ""
+        elif not beta_index or beta_index == "MISSING":
+            beta_status = "missing"
+            beta_index_out = ""
+            beta_prefix_out = ""
+            beta_fields_n = ""
+            beta_docs = ""
+            beta_index_size = ""
+            beta_avg = ""
         else:
-            resolved_index = stage_index if not beta_disabled else beta_index
-            field_count = 0
+            beta_status = "ok"
+            beta_index_out = beta_index
+            beta_prefix_out = entry.get("beta_prefix") or ""
+            beta_fields_n = len(beta_fields)
+            beta_docs = beta_size.get("docs_count", 0)
+            beta_index_size = beta_size.get("store_size") or "0b"
+            beta_avg = beta_size.get("avg_log_size") or ""
 
         stage_ecs = (entry.get("ecs") or {}).get("stage")
         beta_ecs = (entry.get("ecs") or {}).get("beta")
-        archetype_fields = stage_fields or beta_fields
         target_log_format = classify_log_format_archetype(
-            archetype_fields, ecs_info=stage_ecs or beta_ecs
+            stage_fields or beta_fields, ecs_info=stage_ecs or beta_ecs
         )
 
         rows.append(
             {
-                "project_prefix": prefix,
-                "core_team": core_team_of(prefix),
-                "resolved_index": resolved_index,
-                "field_count": field_count,
-                "stage_index": stage_index,
-                "stage_field_count": len(stage_fields),
-                "beta_index": beta_index,
-                "beta_field_count": len(beta_fields),
-                "target_log_format": target_log_format,
+                "service": prefix,
+                "team": core_team_of(prefix),
+                "log_format": target_log_format,
+                "stage_index": stage_index or "",
+                "stage_fields": len(stage_fields) if stage_index else "",
+                "stage_docs": stage_size.get("docs_count", 0) if stage_index else "",
+                "stage_index_size": (stage_size.get("store_size") or "0b")
+                if stage_index
+                else "",
+                "stage_avg_log_size": (stage_size.get("avg_log_size") or "")
+                if stage_index
+                else "",
+                "beta_index": beta_index_out,
+                "beta_prefix": beta_prefix_out,
+                "beta_fields": beta_fields_n,
+                "beta_docs": beta_docs,
+                "beta_index_size": beta_index_size,
+                "beta_avg_log_size": beta_avg,
+                "beta_status": beta_status,
+                "_sort_bytes": int(stage_size.get("store_size_bytes") or 0)
+                if stage_index
+                else 0,
             }
         )
+
+    rows.sort(key=lambda r: int(r.get("_sort_bytes") or 0), reverse=True)
+    for row in rows:
+        row.pop("_sort_bytes", None)
 
     Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, "w", encoding="utf-8", newline="") as fh:
@@ -1296,7 +1599,13 @@ def export_index_field_counts_csv(
 
 
 def _build_prefix_yaml_entry(entry: Dict[str, Any], beta_enabled: bool) -> Dict[str, Any]:
-    """Build a readable per-prefix YAML document body."""
+    """
+    Human-readable per-service YAML from live ES mappings.
+
+    ``fields`` under each env are exactly the flattened Elasticsearch mapping
+    types (same as ``GET /<index>/_mapping``). Diffs live under ``comparison``
+    instead of duplicating every field twice.
+    """
     beta_disabled = (not beta_enabled) or entry.get("beta_disabled") or (
         entry.get("beta_index") == "DISABLED"
     )
@@ -1304,33 +1613,92 @@ def _build_prefix_yaml_entry(entry: Dict[str, Any], beta_enabled: bool) -> Dict[
     stage_fields: Dict[str, str] = entry.get("stage_fields") or {}
     stage_ecs = (entry.get("ecs") or {}).get("stage")
     beta_ecs = (entry.get("ecs") or {}).get("beta")
+    stage_size = entry.get("stage_size") or empty_index_size_stats()
+    beta_size = entry.get("beta_size") or empty_index_size_stats()
+
+    def _env_block(
+        *,
+        index: Optional[str],
+        fields: Dict[str, str],
+        size: Dict[str, Any],
+        ecs_info: Optional[Dict[str, Any]],
+        prefix: Optional[str] = None,
+        missing_label: str = "MISSING",
+    ) -> Dict[str, Any]:
+        if not index or index in ("MISSING", "DISABLED"):
+            return {"index": missing_label, "present": False}
+        block: Dict[str, Any] = {
+            "index": index,
+            "present": True,
+            "docs": size.get("docs_count", 0),
+            "index_size": size.get("store_size") or "0b",
+            "avg_log_size": size.get("avg_log_size"),
+            "field_count": len(fields),
+            "ecs_ready": bool(ecs_info and ecs_info.get("ecs_ready")),
+            "ecs_score": (
+                f"{(ecs_info or {}).get('ecs_fields_present', 0)}/"
+                f"{(ecs_info or {}).get('ecs_fields_total', 5)}"
+            ),
+            # Exact ES mapping types for this index.
+            "fields": {k: fields[k] for k in sorted(fields)},
+        }
+        if prefix:
+            block["prefix"] = prefix
+        return block
+
     archetype_fields = stage_fields or beta_fields
     archetype_ecs = stage_ecs or beta_ecs
-
-    # Prefer Stage fields for the human-readable field list (Stage-only mode default).
-    primary_fields = stage_fields if stage_fields else beta_fields
-    primary_env = "stage" if stage_fields else ("beta" if beta_fields else "none")
-
     body: Dict[str, Any] = {
-        "stage_index": entry.get("stage_index") or "MISSING",
-        "beta_index": "DISABLED" if beta_disabled else (entry.get("beta_index") or "MISSING"),
-        "target_log_format": classify_log_format_archetype(
+        "log_format": classify_log_format_archetype(
             archetype_fields, ecs_info=archetype_ecs
         ),
-        "primary_env": primary_env,
-        "field_count": len(primary_fields),
-        "fields": {k: primary_fields[k] for k in sorted(primary_fields)},
+        "stage": _env_block(
+            index=entry.get("stage_index"),
+            fields=stage_fields,
+            size=stage_size,
+            ecs_info=stage_ecs,
+        ),
     }
 
-    # When both envs are active, also expose a side-by-side type view for drifts.
-    if beta_enabled and beta_fields and stage_fields:
-        all_names = sorted(set(beta_fields) | set(stage_fields))
-        body["fields_by_env"] = {
-            name: {
-                "beta": beta_fields.get(name, "N/A"),
-                "stage": stage_fields.get(name, "N/A"),
+    if beta_disabled:
+        body["beta"] = {"index": "DISABLED", "present": False}
+    else:
+        body["beta"] = _env_block(
+            index=entry.get("beta_index"),
+            fields=beta_fields,
+            size=beta_size,
+            ecs_info=beta_ecs,
+            prefix=entry.get("beta_prefix") or None,
+            missing_label="MISSING",
+        )
+
+    # Compact diff only (no full fields_by_env duplication).
+    if stage_fields and beta_fields:
+        stage_keys = set(stage_fields)
+        beta_keys = set(beta_fields)
+        only_stage = sorted(stage_keys - beta_keys)
+        only_beta = sorted(beta_keys - stage_keys)
+        type_mismatches = [
+            {
+                "field": name,
+                "stage_type": stage_fields[name],
+                "beta_type": beta_fields[name],
             }
-            for name in all_names
+            for name in sorted(stage_keys & beta_keys)
+            if stage_fields[name] != beta_fields[name]
+        ]
+        body["comparison"] = {
+            "common_fields": len(stage_keys & beta_keys),
+            "only_in_stage_count": len(only_stage),
+            "only_in_beta_count": len(only_beta),
+            "type_mismatch_count": len(type_mismatches),
+            "only_in_stage": only_stage,
+            "only_in_beta": only_beta,
+            "type_mismatches": type_mismatches,
+        }
+    elif entry.get("status") == "missing_beta":
+        body["comparison"] = {
+            "note": "No matching Beta index (check beta_prefix_aliases / shipping).",
         }
 
     return body
@@ -1347,11 +1715,21 @@ def export_mappings_to_yaml(
     Writes:
       - ``results/all_index_mappings.yaml`` — all prefixes in one file::
 
-            ams-fundhub:
-              stage_index: ams-fundhub-logs-2026.08.01
-              fields:
-                "@timestamp": date
-                log.level: keyword
+            mic-myagah:
+              log_format: Format 3 (...)
+              stage:
+                index: mic-myagah-2026.08.01
+                docs: 41367
+                index_size: 24.8mb
+                avg_log_size: 628b
+                fields:          # exact ES mapping types
+                  "@timestamp": date
+              beta:
+                index: mic-beta-myagah-logs-2026.08.01
+                fields: ...
+              comparison:        # diffs only (not a full duplicate)
+                only_in_stage: [...]
+                type_mismatches: [...]
 
       - ``results/index_mappings/<prefix>.yaml`` — one file per prefix
     """

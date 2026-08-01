@@ -25,5 +25,19 @@
     "mic-segmentlogs",
     "mic-stage-research",
     "mic-staging-myagah"
-  ]
+  ],
+  "beta_prefix_aliases": {
+    "mic-ava": "mic-beta-ava",
+    "mic-myagah": "mic-beta-myagah",
+    "mic-staging-myagah": "mic-beta-myagah",
+    "mic-stage-research": "mic-beta-research",
+    "mic-iss.coreapi": "mic-beta-iss",
+    "mic-iss.externalapi": "mic-beta-iss",
+    "mic-iss.happycall": "mic-beta-iss",
+    "mic-iss.hub": "mic-beta-iss",
+    "mic-iss.internalapi": "mic-beta-iss",
+    "mic-iss.jobs": "mic-beta-iss",
+    "mic-iss.notification": "mic-beta-iss",
+    "mic-iss.webapi": "mic-beta-iss"
+  }
 }
