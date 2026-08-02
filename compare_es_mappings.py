@@ -40,7 +40,7 @@ import os
 import re
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
@@ -71,6 +71,36 @@ def _utc_now_iso() -> str:
 
 def _utc_today_index_suffix() -> str:
     return _utc_now().strftime("%Y.%m.%d")
+
+
+def parse_index_date(value: Optional[str] = None) -> date:
+    """
+    Parse ``INDEX_DATE`` / panel day into a ``date``.
+
+    Accepts ``YYYY-MM-DD``, ``YYYY.MM.DD``, ``YYYY/MM/DD``. Default: today UTC.
+    """
+    raw = (value if value is not None else os.environ.get("INDEX_DATE", "")).strip()
+    if not raw:
+        return _utc_now().date()
+    normalized = raw.replace("/", "-").replace(".", "-")
+    try:
+        return date.fromisoformat(normalized)
+    except ValueError as exc:
+        raise SystemExit(
+            f"Invalid INDEX_DATE={raw!r}. Use YYYY-MM-DD (e.g. 2026-07-28)."
+        ) from exc
+
+
+def index_date_suffix(as_of: Optional[date] = None) -> str:
+    """Elasticsearch daily index suffix ``YYYY.MM.DD`` for ``as_of`` (default today)."""
+    day = as_of or _utc_now().date()
+    return day.strftime("%Y.%m.%d")
+
+
+def index_date_label(as_of: Optional[date] = None) -> str:
+    """Folder / panel label ``YYYY-MM-DD`` for ``as_of`` (default today)."""
+    day = as_of or _utc_now().date()
+    return day.strftime("%Y-%m-%d")
 
 # Load .env from the script directory (does not override existing env vars).
 _ENV_FILE = Path(__file__).resolve().parent / ".env"
@@ -465,15 +495,25 @@ def new_run_id(now: Optional[datetime] = None) -> str:
     return stamp.strftime("%Y-%m-%d_%H%M%S")
 
 
-def make_run_dir(results_root: Path, run_id: Optional[str] = None) -> Path:
+def make_run_dir(
+    results_root: Path,
+    run_id: Optional[str] = None,
+    index_day: Optional[date] = None,
+) -> Path:
     """
     Create ``results_root/<run_id>/`` for this compare execution.
 
-    ``RESULTS_RUN`` env overrides the folder name (useful for CI / pinned labels).
+    Prefer ``INDEX_DATE`` / ``index_day`` as ``YYYY-MM-DD`` so the panel can
+    open results by log-index day. ``RESULTS_RUN`` still overrides the name.
     """
     override = (run_id or os.environ.get("RESULTS_RUN", "").strip() or "").strip()
-    rid = override or new_run_id()
-    # Keep path segment safe (no slashes).
+    if override:
+        rid = override
+    elif index_day is not None or os.environ.get("INDEX_DATE", "").strip():
+        rid = index_date_label(index_day or parse_index_date(None))
+    else:
+        # Unpinned CLI run: keep timestamped folders so re-runs do not clobber.
+        rid = new_run_id()
     rid = rid.replace("/", "-").replace("\\", "-")
     run_dir = results_root / rid
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -695,30 +735,37 @@ def resolve_latest_index(
     es: Elasticsearch,
     prefix: str,
     cluster_label: str = "",
+    as_of: Optional[date] = None,
 ) -> Optional[str]:
     """
-    Resolve the most recent daily index for ``prefix`` on a cluster.
+    Resolve a daily index for ``prefix`` on a cluster.
 
     Candidate order:
-      1. ``<prefix>-logs-YYYY.MM.DD`` (today)
-      2. ``<prefix>-YYYY.MM.DD`` (today)
-      3. Wildcard ``<prefix>-logs-*`` then ``<prefix>-*``, newest by date /
-         creation time.
+      1. ``<prefix>-logs-YYYY.MM.DD``
+      2. ``<prefix>-YYYY.MM.DD``
 
-    Expected misses (today not yet created) are silent; only a true absence
-    of any matching index is returned as ``None`` (caller may warn once).
+    When ``as_of`` is set (pinned day), **only** those two shapes are accepted —
+    no undated exact-name fallback and no jump to another day.
+
+    When ``as_of`` is ``None``, prefers **today** UTC, then exact ``<prefix>``,
+    then the newest ``<prefix>-logs-*`` / ``<prefix>-*`` match.
     """
     label = cluster_label or "cluster"
-    today = _utc_today_index_suffix()
-    todays_logs = f"{prefix}-logs-{today}"
-    todays_plain = f"{prefix}-{today}"
+    day = as_of or _utc_now().date()
+    suffix = index_date_suffix(day)
+    day_logs = f"{prefix}-logs-{suffix}"
+    day_plain = f"{prefix}-{suffix}"
 
-    if _try_get_index(es, todays_logs):
-        logger.debug("[%s] Using today's logs index for '%s': %s", label, prefix, todays_logs)
-        return todays_logs
-    if _try_get_index(es, todays_plain):
-        logger.debug("[%s] Using today's index for '%s': %s", label, prefix, todays_plain)
-        return todays_plain
+    if _try_get_index(es, day_logs):
+        logger.debug("[%s] Using day logs index for '%s': %s", label, prefix, day_logs)
+        return day_logs
+    if _try_get_index(es, day_plain):
+        logger.debug("[%s] Using day index for '%s': %s", label, prefix, day_plain)
+        return day_plain
+
+    if as_of is not None:
+        # Pinned calendar day: never use undated exact names or another day.
+        return None
 
     # Non-rotated index that matches the prefix exactly (e.g. ``ams-fma``).
     if _try_get_index(es, prefix):
@@ -744,6 +791,7 @@ def resolve_latest_index_beta(
     es: Elasticsearch,
     stage_prefix: str,
     aliases: Optional[Dict[str, str]] = None,
+    as_of: Optional[date] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Resolve Beta index for a Stage service prefix.
@@ -752,7 +800,9 @@ def resolve_latest_index_beta(
     ``(resolved_index, beta_prefix_used)``.
     """
     for candidate in beta_prefix_candidates(stage_prefix, aliases=aliases):
-        resolved = resolve_latest_index(es, candidate, cluster_label="Beta")
+        resolved = resolve_latest_index(
+            es, candidate, cluster_label="Beta", as_of=as_of
+        )
         if resolved:
             if candidate != stage_prefix:
                 logger.info(
@@ -763,6 +813,59 @@ def resolve_latest_index_beta(
                 )
             return resolved, candidate
     return None, None
+
+
+_INDEX_DAY_RE = re.compile(r"(?:^|-)(\d{4})\.(\d{2})\.(\d{2})(?:$|-)")
+
+
+def list_available_index_dates(
+    es: Elasticsearch,
+    prefixes: Optional[List[str]] = None,
+    limit_prefixes: int = 8,
+) -> List[date]:
+    """
+    Scan a cluster for daily index suffixes across a sample of service prefixes.
+    Returns dates newest-first.
+    """
+    prefixes = prefixes or load_service_prefixes()
+    found: Set[date] = set()
+    for prefix in prefixes[: max(1, limit_prefixes)]:
+        for pattern in (f"{prefix}-logs-*", f"{prefix}-*"):
+            try:
+                rows = es.cat.indices(index=pattern, format="json", h="index")
+            except Exception:  # noqa: BLE001
+                continue
+            for row in rows or []:
+                name = str((row or {}).get("index") or "")
+                if not _index_belongs_to_prefix(name, prefix):
+                    continue
+                match = _INDEX_DAY_RE.search(name)
+                if not match:
+                    continue
+                try:
+                    found.add(
+                        date(
+                            int(match.group(1)),
+                            int(match.group(2)),
+                            int(match.group(3)),
+                        )
+                    )
+                except ValueError:
+                    continue
+    return sorted(found, reverse=True)
+
+
+def count_stage_indices_for_day(
+    stage: Elasticsearch,
+    prefixes: List[str],
+    as_of: date,
+) -> int:
+    """How many prefixes have a Stage index for the pinned calendar day."""
+    hits = 0
+    for prefix in prefixes:
+        if resolve_latest_index(stage, prefix, cluster_label="Stage", as_of=as_of):
+            hits += 1
+    return hits
 
 
 def _resolve_from_wildcard(
@@ -1174,11 +1277,13 @@ def compare_clusters(
     stage: Elasticsearch,
     prefixes: Optional[List[str]] = None,
     enable_beta: Optional[bool] = None,
+    as_of: Optional[date] = None,
 ) -> Dict[str, Any]:
     prefixes = prefixes or CORE_INDEX_PREFIXES
     beta_enabled = ENABLE_BETA if enable_beta is None else enable_beta
     results: List[Dict[str, Any]] = []
     beta_aliases = load_beta_prefix_aliases() if beta_enabled else {}
+    index_day = index_date_label(as_of) if as_of is not None else None
 
     for prefix in prefixes:
         entry: Dict[str, Any] = {
@@ -1205,12 +1310,14 @@ def compare_clusters(
                 if beta is None:
                     raise RuntimeError("ENABLE_BETA is True but Beta client is None")
                 beta_index, beta_prefix_used = resolve_latest_index_beta(
-                    beta, prefix, aliases=beta_aliases
+                    beta, prefix, aliases=beta_aliases, as_of=as_of
                 )
             else:
                 beta_index = "DISABLED"
 
-            stage_index = resolve_latest_index(stage, prefix, cluster_label="Stage")
+            stage_index = resolve_latest_index(
+                stage, prefix, cluster_label="Stage", as_of=as_of
+            )
             entry["beta_index"] = beta_index
             entry["beta_prefix"] = beta_prefix_used
             entry["stage_index"] = stage_index
@@ -1338,6 +1445,8 @@ def compare_clusters(
 
     return {
         "generated_at": _utc_now_iso(),
+        "index_date": index_day or index_date_label(as_of or _utc_now().date()),
+        "index_date_pinned": as_of is not None,
         "enable_beta": beta_enabled,
         "mode": "beta_and_stage" if beta_enabled else "stage_only",
         "prefixes_total": len(prefixes),
@@ -2047,33 +2156,28 @@ def main(
     mappings_yaml: str = MAPPINGS_YAML_FILE,
     mappings_yaml_dir: str = MAPPINGS_YAML_DIR,
     enable_beta: Optional[bool] = None,
+    index_date: Optional[str] = None,
 ) -> int:
     """
     Entry point.
 
-    ``config`` example::
-
-        {
-            "beta": {"url": "...", "user": "...", "password": "..."},
-            "stage": {"url": "...", "user": "...", "password": "..."},
-            "verify_certs": False,
-        }
-
-    Set ``ENABLE_BETA=true`` in the environment (or pass ``enable_beta=True``)
-    to inspect Beta as well. Default is Stage-only.
+    ``index_date`` / env ``INDEX_DATE`` pins resolution to that calendar day's
+    indices (``YYYY-MM-DD``). Results are written under ``results/<YYYY-MM-DD>/``.
     """
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s %(message)s",
         stream=sys.stderr,
     )
-    # Keep CLI clean: hide elasticsearch transport chatter and expected miss noise.
     logging.getLogger("elasticsearch").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     beta_enabled = ENABLE_BETA if enable_beta is None else enable_beta
 
-    # Always reload prefixes.json so edits after import are picked up.
+    raw_index_date = (index_date or os.environ.get("INDEX_DATE", "")).strip()
+    as_of: Optional[date] = parse_index_date(raw_index_date) if raw_index_date else None
+    day_label = index_date_label(as_of or _utc_now().date())
+
     global CORE_INDEX_PREFIXES
     if prefixes is None:
         CORE_INDEX_PREFIXES = load_service_prefixes()
@@ -2100,7 +2204,6 @@ def main(
         )
         return 1
 
-    # Prefer results/; fall back to results_local/ when Docker left root/nobody files.
     global RESULTS_ROOT, RESULTS_DIR, OUTPUT_FILE, MAPPINGS_CSV_FILE, READINESS_CSV_FILE
     global FIELD_COUNTS_CSV_FILE, MAPPINGS_YAML_FILE, MAPPINGS_YAML_DIR
     results_root = resolve_results_dir(RESULTS_ROOT)
@@ -2116,25 +2219,6 @@ def main(
         )
 
     migrate_legacy_flat_results(results_root)
-    run_dir = make_run_dir(results_root)
-    point_latest_symlink(results_root, run_dir)
-
-    RESULTS_ROOT = results_root
-    RESULTS_DIR = run_dir
-    output = str(RESULTS_DIR / "mapping_comparison.json")
-    mappings_csv = str(RESULTS_DIR / "all_index_mappings.csv")
-    readiness_csv = str(RESULTS_DIR / "central_format_readiness.csv")
-    field_counts_csv = str(RESULTS_DIR / "index_field_counts.csv")
-    mappings_yaml = str(RESULTS_DIR / "all_index_mappings.yaml")
-    mappings_yaml_dir = str(RESULTS_DIR / "index_mappings")
-    OUTPUT_FILE = output
-    MAPPINGS_CSV_FILE = mappings_csv
-    READINESS_CSV_FILE = readiness_csv
-    FIELD_COUNTS_CSV_FILE = field_counts_csv
-    MAPPINGS_YAML_FILE = mappings_yaml
-    MAPPINGS_YAML_DIR = mappings_yaml_dir
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info("Writing this run to %s", RESULTS_DIR)
 
     config = config or {}
     shared_verify = config.get("verify_certs")
@@ -2159,7 +2243,6 @@ def main(
         "STAGE_ES_URL", "STAGE_ES_USER", "STAGE_ES_PASSWORD", "Stage", stage_cfg
     )
 
-    # Lightweight connectivity check (Stage always; Beta only when enabled)
     clients_to_ping: List[Tuple[str, Elasticsearch]] = [("Stage", stage)]
     if beta_enabled and beta is not None:
         clients_to_ping.insert(0, ("Beta", beta))
@@ -2167,15 +2250,76 @@ def main(
     for label, client in clients_to_ping:
         try:
             if not client.ping():
-                print(f"WARNING: {label} cluster did not respond to ping()", file=sys.stderr)
+                print(
+                    f"WARNING: {label} cluster did not respond to ping()",
+                    file=sys.stderr,
+                )
         except Exception as exc:  # noqa: BLE001
             print(
                 f"WARNING: {label} ping failed: {_explain_transport_error(exc)}",
                 file=sys.stderr,
             )
 
+    # Pinned day: require Stage daily indices BEFORE creating results/<day>/.
+    if as_of is not None:
+        stage_hits = count_stage_indices_for_day(stage, prefixes, as_of)
+        if stage_hits == 0:
+            suffix = index_date_suffix(as_of)
+            msg = (
+                f"No Stage indices for INDEX_DATE={day_label} "
+                f"(looked for *-logs-{suffix} / *-{suffix}). "
+                "Results folder was NOT created."
+            )
+            logger.error(msg)
+            print(f"ERROR: {msg}", file=sys.stderr)
+            stale = results_root / day_label
+            if stale.is_dir():
+                # Do not keep a day folder when Stage has no daily indices.
+                shutil.rmtree(stale, ignore_errors=True)
+                print(f"Removed empty/invalid results folder: {stale}", file=sys.stderr)
+            return 1
+        logger.info(
+            "INDEX_DATE=%s — found %d Stage index(es) for %s",
+            day_label,
+            stage_hits,
+            index_date_suffix(as_of),
+        )
+
+    if as_of is not None and not os.environ.get("RESULTS_RUN", "").strip():
+        run_dir = make_run_dir(results_root, run_id=day_label)
+    else:
+        run_dir = make_run_dir(results_root, index_day=as_of)
+    point_latest_symlink(results_root, run_dir)
+
+    RESULTS_ROOT = results_root
+    RESULTS_DIR = run_dir
+    output = str(RESULTS_DIR / "mapping_comparison.json")
+    mappings_csv = str(RESULTS_DIR / "all_index_mappings.csv")
+    readiness_csv = str(RESULTS_DIR / "central_format_readiness.csv")
+    field_counts_csv = str(RESULTS_DIR / "index_field_counts.csv")
+    mappings_yaml = str(RESULTS_DIR / "all_index_mappings.yaml")
+    mappings_yaml_dir = str(RESULTS_DIR / "index_mappings")
+    OUTPUT_FILE = output
+    MAPPINGS_CSV_FILE = mappings_csv
+    READINESS_CSV_FILE = readiness_csv
+    FIELD_COUNTS_CSV_FILE = field_counts_csv
+    MAPPINGS_YAML_FILE = mappings_yaml
+    MAPPINGS_YAML_DIR = mappings_yaml_dir
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    if as_of is not None:
+        logger.info("Writing INDEX_DATE=%s results to %s", day_label, RESULTS_DIR)
+    else:
+        logger.info(
+            "Writing this run to %s (prefer today, fallback newest)",
+            RESULTS_DIR,
+        )
+
     report = compare_clusters(
-        beta, stage, prefixes=prefixes, enable_beta=beta_enabled
+        beta,
+        stage,
+        prefixes=prefixes,
+        enable_beta=beta_enabled,
+        as_of=as_of,
     )
     json_path = save_report(report, path=output)
     mappings_path = export_mappings_to_csv(report, csv_path=mappings_csv)
@@ -2192,6 +2336,7 @@ def main(
 
     print(_hr("-"))
     print(" Exported files:")
+    print(f"  Index day : {report.get('index_date', day_label)}")
     print(f"  JSON : {json_path}")
     print(f"  CSV  : {mappings_path}")
     print(f"  CSV  : {readiness_path}")
@@ -2200,10 +2345,10 @@ def main(
     print(f"  YAML : {yaml_dir}/<prefix>.yaml")
     print(_hr())
 
-    # Non-zero exit when drifts or mismatches exist (handy for CI)
     if report["prefixes_with_type_mismatches"] or report["prefixes_with_schema_drift"]:
         return 2
     return 0
+
 
 
 if __name__ == "__main__":

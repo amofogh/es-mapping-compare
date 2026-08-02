@@ -9,15 +9,14 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # set STAGE_ES_* (and optional BETA_ES_*)
 
-python discover_prefixes.py          # refresh prefixes.json
-# edit prefixes.json if needed
-ENABLE_BETA=false python compare_es_mappings.py
+python discover_prefixes.py
+# pin a calendar day of daily indices (YYYY-MM-DD):
+INDEX_DATE=2026-07-28 ENABLE_BETA=false python compare_es_mappings.py
 
 docker compose --profile panel up -d --build panel   # http://localhost:8501
-# or: streamlit run app.py
 ```
 
-Use ES API port **9200** (not Kibana 5601).
+In the panel: pick an **Index day** → **Fetch from Elasticsearch** (loads that day's `*-YYYY.MM.DD` indices). Use ES API port **9200**.
 
 ## Docker pipeline
 
@@ -33,7 +32,8 @@ docker compose run --rm --entrypoint /docker-entrypoint.sh es-mapping-compare fi
 
 ## Outputs
 
-Each run writes `results/<YYYY-MM-DD_HHMMSS>/`; `results/latest` → newest.
+Pinned day → `results/<YYYY-MM-DD>/` (e.g. `INDEX_DATE=2026-07-28`).  
+`results/latest` → newest run.
 
 | File | What |
 |------|------|

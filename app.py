@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+from datetime import date as date_cls
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +19,7 @@ REQUIRED_FILES = (
     "all_index_mappings.csv",
     "mapping_comparison.json",
 )
-OPTIONAL_FILES = ("index_field_counts.csv",)
+DAY_FOLDER_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:_\d{6})?$")
 
 st.set_page_config(
     page_title="EFK Schema Migration",
@@ -48,29 +51,71 @@ st.markdown(
         border-radius: 12px;
         padding: 1rem 1.1rem;
         box-shadow: 0 4px 14px rgba(15, 23, 42, 0.25);
+        height: 100%;
+        min-height: 110px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        box-sizing: border-box;
+    }
+
+    /* Equal-width KPI columns */
+    div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) {
+        align-items: stretch;
+    }
+
+    div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"])
+      > div[data-testid="stColumn"] {
+        flex: 1 1 0 !important;
+        width: 0 !important;
+        min-width: 0 !important;
     }
 
     div[data-testid="stMetric"] label {
         color: #94a3b8 !important;
+        min-height: 2.4rem;
+        display: flex;
+        align-items: flex-end;
+        line-height: 1.2;
     }
 
     div[data-testid="stMetric"] [data-testid="stMetricValue"] {
         color: #f8fafc !important;
         font-weight: 700;
+        font-size: 1.75rem !important;
     }
 
     .stTabs [data-baseweb="tab-list"] {
-        gap: 0.5rem;
+        gap: 0.35rem;
         border-bottom: 1px solid #334155;
+        flex-wrap: wrap;
     }
 
     .stTabs [data-baseweb="tab"] {
         border-radius: 8px 8px 0 0;
-        padding: 0.6rem 1.1rem;
+        padding: 0.55rem 0.9rem;
         font-weight: 600;
     }
 
     .stAlert { border-radius: 10px; }
+
+    /* Sleek dashboard status bar */
+    .efk-status-bar {
+        background: #0f172a;
+        border: 1px solid #1e293b;
+        color: #cbd5e1;
+        border-radius: 10px;
+        padding: 0.75rem 1rem;
+        margin: 0.35rem 0 0.85rem 0;
+        font-size: 0.92rem;
+        line-height: 1.45;
+    }
+    .efk-status-bar code {
+        color: #e2e8f0;
+        background: #1e293b;
+        padding: 0.1rem 0.35rem;
+        border-radius: 4px;
+    }
 
     div[data-testid="stExpander"] {
         border: 1px solid #334155;
@@ -88,17 +133,11 @@ st.markdown(
         border: 1px solid #fca5a5;
     }
 
-    .ecs-pill {
-        display: inline-block;
-        padding: 0.15rem 0.55rem;
-        border-radius: 999px;
-        font-size: 0.8rem;
+    /* Align action-row primary button height */
+    div[data-testid="stHorizontalBlock"] button[kind="primary"] {
+        min-height: 2.6rem;
         font-weight: 600;
-        margin-right: 0.35rem;
     }
-    .ecs-ok { background: #14532d; color: #bbf7d0; }
-    .ecs-miss { background: #7f1d1d; color: #fecaca; }
-    .ecs-legacy { background: #713f12; color: #fde68a; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -109,35 +148,85 @@ def _is_complete_run(path: Path) -> bool:
     return path.is_dir() and all((path / name).is_file() for name in REQUIRED_FILES)
 
 
+def _day_from_folder(name: str) -> str | None:
+    match = DAY_FOLDER_RE.match(name)
+    return match.group(1) if match else None
+
+
+def _infer_day_from_report(run_dir: Path) -> str | None:
+    meta_path = run_dir / "mapping_comparison.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        with meta_path.open(encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if meta.get("index_date"):
+        return str(meta["index_date"])[:10].replace(".", "-")
+    for entry in meta.get("results") or []:
+        for key in ("stage_index", "beta_index"):
+            name = str(entry.get(key) or "")
+            m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})", name)
+            if m:
+                return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return None
+
+
+def _folder_has_stage_for_day(run_dir: Path, day: str) -> bool:
+    """True if the report resolved at least one Stage index for ``day``."""
+    meta_path = run_dir / "mapping_comparison.json"
+    if not meta_path.is_file():
+        return False
+    try:
+        with meta_path.open(encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return False
+    suffix = day.replace("-", ".")
+    for entry in meta.get("results") or []:
+        idx = entry.get("stage_index")
+        if idx and suffix in str(idx):
+            return True
+    return False
+
+
 @st.cache_data(show_spinner=False)
-def discover_runs(results_root: str) -> list[str]:
-    """Return run folder names newest-first (plus legacy flat root as ``legacy``)."""
+def discover_days(results_root: str) -> dict[str, str]:
+    """
+    Map index-day ``YYYY-MM-DD`` → best results folder name.
+
+    Prefers exact ``YYYY-MM-DD`` folders over timestamped legacy runs.
+    """
     root = Path(results_root)
     if not root.exists():
-        return []
+        return {}
 
-    runs: list[tuple[float, str]] = []
+    by_day: dict[str, list[tuple[int, float, str]]] = {}
     for child in root.iterdir():
-        if child.name in {"latest", "index_mappings"}:
+        if child.name in {"latest", "index_mappings"} or child.is_symlink():
             continue
-        if child.is_symlink():
+        if not _is_complete_run(child):
             continue
-        if _is_complete_run(child):
-            try:
-                mtime = (child / "mapping_comparison.json").stat().st_mtime
-            except OSError:
-                mtime = child.stat().st_mtime
-            runs.append((mtime, child.name))
-
-    if all((root / name).is_file() for name in REQUIRED_FILES):
+        day = _day_from_folder(child.name) or _infer_day_from_report(child)
+        if not day:
+            continue
+        # Skip caches with zero Stage daily indexes for that day.
+        if not _folder_has_stage_for_day(child, day):
+            continue
+        # Prefer plain YYYY-MM-DD (rank 0) over YYYY-MM-DD_HHMMSS (rank 1)
+        rank = 0 if child.name == day else 1
         try:
-            mtime = (root / "mapping_comparison.json").stat().st_mtime
+            mtime = (child / "mapping_comparison.json").stat().st_mtime
         except OSError:
-            mtime = 0.0
-        runs.append((mtime, "legacy"))
+            mtime = child.stat().st_mtime
+        by_day.setdefault(day, []).append((rank, -mtime, child.name))
 
-    runs.sort(key=lambda item: item[0], reverse=True)
-    return [name for _, name in runs]
+    chosen: dict[str, str] = {}
+    for day, candidates in by_day.items():
+        candidates.sort()
+        chosen[day] = candidates[0][2]
+    return dict(sorted(chosen.items(), reverse=True))
 
 
 def _run_path(run_id: str) -> Path:
@@ -157,6 +246,137 @@ def _boolify(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
                 .isin({"TRUE", "1", "YES"})
             )
     return df
+
+
+@st.cache_data(show_spinner=False)
+def list_es_index_days() -> list[str]:
+    """Ask Stage ES which daily index dates exist (for the date picker)."""
+    try:
+        from compare_es_mappings import (  # local import keeps Streamlit startup light
+            build_es_client,
+            list_available_index_dates,
+            load_service_prefixes,
+        )
+
+        stage = build_es_client(
+            "STAGE_ES_URL", "STAGE_ES_USER", "STAGE_ES_PASSWORD", "Stage"
+        )
+        days = list_available_index_dates(stage, load_service_prefixes())
+        return [d.isoformat() for d in days]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def fetch_index_day(
+    day: str,
+    enable_beta: bool | None = None,
+    prefix_filter: str = "",
+) -> tuple[int, str]:
+    """Run compare for a pinned index day; returns (exit_code, log_tail)."""
+    import contextlib
+    import io
+
+    from compare_es_mappings import main as compare_main
+
+    # PREFIX_FILTER is read inside filter_prefixes() / main().
+    prev = os.environ.get("PREFIX_FILTER")
+    if prefix_filter:
+        os.environ["PREFIX_FILTER"] = prefix_filter
+    elif "PREFIX_FILTER" in os.environ:
+        del os.environ["PREFIX_FILTER"]
+
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = compare_main(index_date=day, enable_beta=enable_beta)
+    finally:
+        if prev is None:
+            os.environ.pop("PREFIX_FILTER", None)
+        else:
+            os.environ["PREFIX_FILTER"] = prev
+    return code, buf.getvalue()[-4000:]
+
+
+@st.cache_data(show_spinner=False)
+def load_team_options() -> list[str]:
+    """Team namespaces from prefixes.json (+ fallbacks from service names)."""
+    path = Path(__file__).resolve().parent / "prefixes.json"
+    teams: set[str] = set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for t in data.get("core_domain_prefixes") or []:
+            if str(t).strip():
+                teams.add(str(t).strip().lower())
+        for p in data.get("service_prefixes") or []:
+            name = str(p).strip().lower()
+            if name:
+                teams.add(name.split("-", 1)[0].split(".", 1)[0])
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return sorted(teams)
+
+
+def _core_team(prefix: str) -> str:
+    p = str(prefix or "").strip().lower()
+    if not p:
+        return ""
+    return p.split("-", 1)[0].split(".", 1)[0]
+
+
+def apply_project_filter(
+    readiness: pd.DataFrame,
+    mappings: pd.DataFrame,
+    comparison: dict[str, Any],
+    field_counts: pd.DataFrame | None,
+    team: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], pd.DataFrame | None]:
+    """Keep only rows/projects for team namespace, or everything when team is All."""
+    if not team or team == "All":
+        return readiness, mappings, comparison, field_counts
+
+    team_l = team.lower()
+    ready = readiness
+    if "core_team" in readiness.columns:
+        ready = readiness[
+            readiness["core_team"].astype(str).str.lower() == team_l
+        ].copy()
+    elif "project_prefix" in readiness.columns:
+        ready = readiness[
+            readiness["project_prefix"].map(_core_team) == team_l
+        ].copy()
+
+    maps = mappings
+    if "project_prefix" in mappings.columns:
+        maps = mappings[
+            mappings["project_prefix"].map(_core_team) == team_l
+        ].copy()
+
+    counts = field_counts
+    if field_counts is not None:
+        if "team" in field_counts.columns:
+            counts = field_counts[
+                field_counts["team"].astype(str).str.lower() == team_l
+            ].copy()
+        elif "service" in field_counts.columns:
+            counts = field_counts[
+                field_counts["service"].map(_core_team) == team_l
+            ].copy()
+
+    filtered_results = [
+        entry
+        for entry in (comparison.get("results") or [])
+        if _core_team(entry.get("prefix", "")) == team_l
+    ]
+    filtered_comparison = dict(comparison)
+    filtered_comparison["results"] = filtered_results
+    filtered_comparison["prefixes_total"] = len(filtered_results)
+    filtered_comparison["prefixes_with_schema_drift"] = sum(
+        1 for r in filtered_results if r.get("has_schema_drift")
+    )
+    filtered_comparison["prefixes_with_type_mismatches"] = sum(
+        1 for r in filtered_results if r.get("has_type_mismatch")
+    )
+    return ready, maps, filtered_comparison, counts
 
 
 @st.cache_data(show_spinner="Loading migration reports…")
@@ -399,42 +619,121 @@ def _render_list_table(title: str, items: list[Any], empty: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap
+# Bootstrap — pick an index day, fetch from ES if needed
 # ---------------------------------------------------------------------------
-available_runs = discover_runs(str(RESULTS_ROOT))
-if not available_runs:
-    st.error(
-        f"⚠️ No dated result runs found under `{RESULTS_ROOT}`. "
-        "Run `python compare_es_mappings.py` first."
+cached_days = discover_days(str(RESULTS_ROOT))  # day -> folder
+es_days = list_es_index_days()
+all_day_options = sorted(set(cached_days) | set(es_days), reverse=True)
+
+default_day = date_cls.today()
+if cached_days:
+    default_day = date_cls.fromisoformat(next(iter(cached_days)))
+elif es_days:
+    default_day = date_cls.fromisoformat(es_days[0])
+
+st.title("🔎 EFK Migration & Schema Analyzer")
+
+team_options = ["All"] + load_team_options()
+
+# Row 1 — Date inputs & comparison setup
+col1, col2, col3 = st.columns([1, 1, 1], gap="medium")
+with col1:
+    selected_day_date = st.date_input(
+        "Index day",
+        value=default_day,
+        help="Resolves Stage/Beta indices for this calendar day "
+        "(e.g. mic-ava-logs-2026.07.28).",
+    )
+    selected_day = selected_day_date.isoformat()
+with col2:
+    baseline_options = ["(none)"] + [d for d in all_day_options if d != selected_day]
+    baseline_day = st.selectbox(
+        "Compare against day",
+        options=baseline_options,
+        index=0,
+    )
+with col3:
+    project_filter = st.selectbox(
+        "Projects filter",
+        options=team_options,
+        index=0,
+        help="All = every service in prefixes.json. "
+        "Pick a team (e.g. mic, ams) to limit view and Fetch.",
+    )
+
+# Row 2 — Actions & toggles (pad toggle so it centers vs primary button)
+col_toggle, col_btn = st.columns([1, 3], gap="medium")
+with col_toggle:
+    st.markdown(
+        "<div style='padding-top: 1.8rem;'></div>",
+        unsafe_allow_html=True,
+    )
+    enable_beta_ui = st.toggle(
+        "Include Beta",
+        value=os.environ.get("ENABLE_BETA", "false").lower() in ("1", "true", "yes"),
+    )
+with col_btn:
+    fetch_clicked = st.button(
+        "⬇ Fetch from Elasticsearch",
+        type="primary",
+        use_container_width=True,
+        help="Query ES for this day's indices. Uses Projects filter "
+        "(All or a single team like mic).",
+    )
+
+# Status — available Stage days
+if es_days:
+    st.caption(
+        "Days found on Stage ES: "
+        + ", ".join(f"`{d}`" for d in es_days[:14])
+        + (" …" if len(es_days) > 14 else "")
+    )
+else:
+    st.caption(
+        "Could not list days from Elasticsearch (check `.env` / network). "
+        "You can still pick a day and fetch."
+    )
+
+if fetch_clicked:
+    with st.spinner(f"Fetching mappings for index day {selected_day}…"):
+        # Bust caches after write
+        discover_days.clear()
+        load_data.clear()
+        list_es_index_days.clear()
+        code, log_tail = fetch_index_day(
+            selected_day,
+            enable_beta=enable_beta_ui,
+            prefix_filter="" if project_filter == "All" else project_filter,
+        )
+    if code in (0, 2):
+        st.success(
+            f"Loaded index day `{selected_day}` "
+            f"(exit {code}; 2 means drift/mismatches found)."
+        )
+        if log_tail.strip():
+            with st.expander("Fetch log", expanded=False):
+                st.code(log_tail)
+        cached_days = discover_days(str(RESULTS_ROOT))
+        st.rerun()
+    else:
+        st.error(
+            f"Fetch aborted for `{selected_day}` (exit {code}). "
+            "No results folder was created because Stage has no daily indices "
+            "for that day."
+        )
+        st.code(log_tail or "(no output)")
+        discover_days.clear()
+        cached_days = discover_days(str(RESULTS_ROOT))
+        st.stop()
+
+selected_run = cached_days.get(selected_day)
+if not selected_run:
+    st.warning(
+        f"No cached results for **{selected_day}**. "
+        "Click **Fetch from Elasticsearch** to pull that day's indices "
+        f"(`*-{selected_day.replace('-', '.')}`)."
     )
     st.stop()
-
-latest_link = RESULTS_ROOT / "latest"
-default_run = available_runs[0]
-if latest_link.is_symlink() or latest_link.is_dir():
-    try:
-        resolved = latest_link.resolve().name
-        if resolved in available_runs:
-            default_run = resolved
-    except OSError:
-        pass
-
-pick_col, compare_col = st.columns([2, 2])
-with pick_col:
-    selected_run = st.selectbox(
-        "📅 Result run",
-        options=available_runs,
-        index=available_runs.index(default_run),
-        help="Each compare execution writes results/<YYYY-MM-DD_HHMMSS>/",
-    )
-with compare_col:
-    compare_options = ["(none)"] + [r for r in available_runs if r != selected_run]
-    baseline_run = st.selectbox(
-        "Compare against (baseline)",
-        options=compare_options,
-        index=0,
-        help="Pick an older run to diff field counts, ECS score, and conflicts.",
-    )
 
 try:
     readiness_df, mappings_df, comparison_data, field_counts_df = load_data(
@@ -447,27 +746,79 @@ except Exception as exc:  # noqa: BLE001
     st.error(f"⚠️ Failed to load migration data: {exc}")
     st.stop()
 
+# Apply team filter to everything shown in the panel.
+readiness_df, mappings_df, comparison_data, field_counts_df = apply_project_filter(
+    readiness_df,
+    mappings_df,
+    comparison_data,
+    field_counts_df,
+    project_filter,
+)
+
+if readiness_df.empty and project_filter != "All":
+    st.warning(
+        f"No projects for team **{project_filter}** in this day's results. "
+        "Choose **All**, or Fetch with this filter."
+    )
+    st.stop()
+
 prefix_index = _prefix_lookup(comparison_data)
 kpis = _kpi(readiness_df, comparison_data)
 status_df = _project_status_table(comparison_data)
 
-st.title("🔎 EFK Migration & Schema Analyzer")
-st.caption(
-    f"Run `{selected_run}` · Generated {comparison_data.get('generated_at', '—')} · "
-    f"Mode: `{comparison_data.get('mode', '—')}` · "
-    f"Beta enabled: `{comparison_data.get('enable_beta', False)}`"
+day_suffix = selected_day.replace("-", ".")
+stage_hits = 0
+beta_hits = 0
+stage_wrong_day = 0
+beta_wrong_day = 0
+for entry in comparison_data.get("results") or []:
+    stage_idx = entry.get("stage_index")
+    beta_idx = entry.get("beta_index")
+    if stage_idx and stage_idx not in ("DISABLED", "MISSING"):
+        if day_suffix in str(stage_idx):
+            stage_hits += 1
+        else:
+            stage_wrong_day += 1
+    if beta_idx and beta_idx not in ("DISABLED", "MISSING", None):
+        if day_suffix in str(beta_idx):
+            beta_hits += 1
+        else:
+            beta_wrong_day += 1
+
+st.markdown(
+    f'<div class="efk-status-bar">'
+    f"Index day: <code>{comparison_data.get('index_date', selected_day)}</code> · "
+    f"Folder: <code>{selected_run}</code> · "
+    f"Filter: <code>{project_filter}</code> · "
+    f"Generated: <code>{comparison_data.get('generated_at', '—')}</code> · "
+    f"Mode: <code>{comparison_data.get('mode', '—')}</code> · "
+    f"Beta: <code>{comparison_data.get('enable_beta', False)}</code> · "
+    f"Stage indexes: <strong>{stage_hits}</strong> · "
+    f"Beta indexes: <strong>{beta_hits}</strong>"
+    f"</div>",
+    unsafe_allow_html=True,
 )
 
-tabs = st.tabs(
-    [
-        "🚀 Readiness Dashboard",
-        "📦 Index Inventory",
-        "🗂️ Schema Inspector",
-        "📋 Field Browser",
-        "⚠️ Conflict Resolution",
-        "📉 Run Comparison",
-    ]
-)
+if stage_hits == 0:
+    st.error(
+        f"No Stage daily indices for **{selected_day}** "
+        f"(`*-{day_suffix}` / `*-logs-{day_suffix}`). "
+        "This cached folder is invalid for Stage analysis."
+    )
+    if st.button(f"🗑 Delete invalid cache `{selected_run}`"):
+        import shutil
+
+        shutil.rmtree(_run_path(selected_run), ignore_errors=True)
+        discover_days.clear()
+        load_data.clear()
+        st.rerun()
+    st.stop()
+elif stage_wrong_day or beta_wrong_day:
+    st.warning(
+        f"Some resolved indexes do not contain `{day_suffix}` "
+        f"(Stage wrong-day: {stage_wrong_day}, Beta wrong-day: {beta_wrong_day})."
+    )
+
 (
     tab_readiness,
     tab_inventory,
@@ -475,23 +826,38 @@ tabs = st.tabs(
     tab_fields,
     tab_conflicts,
     tab_compare,
-) = tabs
+) = st.tabs(
+    [
+        "🚀 Readiness",
+        "📦 Inventory",
+        "🗂️ Schema",
+        "📋 Fields",
+        "⚠️ Conflicts",
+        "📉 Compare days",
+    ]
+)
 
 # ---------------------------------------------------------------------------
-# Tab 1 — Readiness Dashboard
+# Tab — Readiness
 # ---------------------------------------------------------------------------
 with tab_readiness:
-    r1, r2, r3, r4, r5, r6 = st.columns(6)
-    r1.metric("Total Projects", kpis["total_projects"])
-    r2.metric("ECS Ready", kpis["ecs_ready"])
-    r3.metric("Not ECS Ready", kpis["not_ecs_ready"])
-    r4.metric("Legacy Workers (F3)", kpis["legacy_workers"])
-    r5.metric("Schema Drift Projects", kpis["schema_drift"])
-    r6.metric(
-        "Type Conflict Projects",
-        kpis["type_conflict_projects"],
-        help=f"{kpis['type_conflicts']} mismatched field rows total",
-    )
+    kpi_cols = st.columns(6, gap="small")
+    with kpi_cols[0]:
+        st.metric("Total Projects", kpis["total_projects"])
+    with kpi_cols[1]:
+        st.metric("ECS Ready", kpis["ecs_ready"])
+    with kpi_cols[2]:
+        st.metric("Not ECS Ready", kpis["not_ecs_ready"])
+    with kpi_cols[3]:
+        st.metric("Legacy Workers (F3)", kpis["legacy_workers"])
+    with kpi_cols[4]:
+        st.metric("Schema Drift Projects", kpis["schema_drift"])
+    with kpi_cols[5]:
+        st.metric(
+            "Type Conflict Projects",
+            kpis["type_conflict_projects"],
+            help=f"{kpis['type_conflicts']} mismatched field rows total",
+        )
 
     st.markdown("##### Central format readiness")
     st.dataframe(
@@ -555,7 +921,7 @@ with tab_readiness:
     )
 
 # ---------------------------------------------------------------------------
-# Tab 2 — Index Inventory
+# Tab — Inventory
 # ---------------------------------------------------------------------------
 with tab_inventory:
     if field_counts_df is None or field_counts_df.empty:
@@ -603,7 +969,7 @@ with tab_inventory:
                 )
 
 # ---------------------------------------------------------------------------
-# Tab 3 — Schema Inspector
+# Tab — Schema
 # ---------------------------------------------------------------------------
 with tab_schema:
     prefixes = sorted(prefix_index.keys()) or sorted(
@@ -628,14 +994,20 @@ with tab_schema:
         beta_ecs = ((entry.get("ecs") or {}).get("beta") or {})
 
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Stage Index", entry.get("stage_index") or "—")
-        m2.metric("Beta Index", entry.get("beta_index") or "—")
+        m1.metric("Stage Index", entry.get("stage_index") or "MISSING")
+        m2.metric("Beta Index", entry.get("beta_index") or "MISSING")
         m3.metric("Beta Prefix", entry.get("beta_prefix") or "—")
         m4.metric("Total Fields", len(set(stage_fields) | set(beta_fields)))
         m5.metric(
             "Status",
             entry.get("status") or "—",
         )
+
+        if not entry.get("stage_index"):
+            st.warning(
+                f"Stage index missing for `{selected}` on `{selected_day}` "
+                f"(`*-{day_suffix}`). Showing Beta-only mapping if present."
+            )
 
         if entry.get("error"):
             st.error(entry["error"])
@@ -742,7 +1114,7 @@ with tab_schema:
                 st.code(_fields_to_yaml(beta_fields), language="yaml")
 
 # ---------------------------------------------------------------------------
-# Tab 4 — Field Browser
+# Tab — Fields
 # ---------------------------------------------------------------------------
 with tab_fields:
     st.markdown("##### All mapped fields")
@@ -818,7 +1190,7 @@ with tab_fields:
     )
 
 # ---------------------------------------------------------------------------
-# Tab 5 — Conflict Resolution
+# Tab — Conflicts
 # ---------------------------------------------------------------------------
 with tab_conflicts:
     conflicts_df = mappings_df[
@@ -903,93 +1275,112 @@ with tab_conflicts:
         st.dataframe(grouped, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------------
-# Tab 6 — Run Comparison
+# Tab — Compare days
 # ---------------------------------------------------------------------------
 with tab_compare:
-    if baseline_run == "(none)":
+    if baseline_day == "(none)":
         st.info(
-            "Select a **baseline** run in the header to diff against the active run. "
-            "Each `compare_es_mappings.py` execution writes a new "
-            "`results/YYYY-MM-DD_HHMMSS/` folder."
+            "Select a **baseline day** in the header to diff against the active index day. "
+            "Fetch both days from Elasticsearch first if they are not cached."
         )
     else:
-        try:
-            base_ready, _, base_meta, _ = load_data(baseline_run)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"⚠️ Failed to load baseline run `{baseline_run}`: {exc}")
-            st.stop()
+        baseline_run = cached_days.get(baseline_day)
+        if not baseline_run:
+            st.warning(
+                f"No cached results for baseline day `{baseline_day}`. "
+                "Switch to that day and click **Fetch from Elasticsearch**."
+            )
+        else:
+            try:
+                base_ready, _, base_meta, _ = load_data(baseline_run)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"⚠️ Failed to load baseline day `{baseline_day}`: {exc}")
+                st.stop()
 
-        base_kpis = _kpi(base_ready, base_meta)
-        cur_kpis = kpis
+            base_ready, _, base_meta, _ = apply_project_filter(
+                base_ready,
+                pd.DataFrame(),
+                base_meta,
+                None,
+                project_filter,
+            )
+            base_kpis = _kpi(base_ready, base_meta)
+            cur_kpis = kpis
 
-        st.markdown(
-            f"**Baseline** `{baseline_run}` "
-            f"({base_meta.get('generated_at', '—')}) → "
-            f"**Current** `{selected_run}` "
-            f"({comparison_data.get('generated_at', '—')})"
-        )
+            st.markdown(
+                f"**Baseline** `{baseline_day}` "
+                f"({base_meta.get('generated_at', '—')}) → "
+                f"**Current** `{selected_day}` "
+                f"({comparison_data.get('generated_at', '—')})"
+            )
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric(
-            "Total Projects",
-            cur_kpis["total_projects"],
-            delta=cur_kpis["total_projects"] - base_kpis["total_projects"],
-        )
-        c2.metric(
-            "ECS Ready",
-            cur_kpis["ecs_ready"],
-            delta=cur_kpis["ecs_ready"] - base_kpis["ecs_ready"],
-        )
-        c3.metric(
-            "Not ECS Ready",
-            cur_kpis["not_ecs_ready"],
-            delta=cur_kpis["not_ecs_ready"] - base_kpis["not_ecs_ready"],
-            delta_color="inverse",
-        )
-        c4.metric(
-            "Schema Drift",
-            cur_kpis["schema_drift"],
-            delta=cur_kpis["schema_drift"] - base_kpis["schema_drift"],
-            delta_color="inverse",
-        )
-        c5.metric(
-            "Type Conflicts",
-            cur_kpis["type_conflicts"],
-            delta=cur_kpis["type_conflicts"] - base_kpis["type_conflicts"],
-            delta_color="inverse",
-        )
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric(
+                "Total Projects",
+                cur_kpis["total_projects"],
+                delta=cur_kpis["total_projects"] - base_kpis["total_projects"],
+            )
+            c2.metric(
+                "ECS Ready",
+                cur_kpis["ecs_ready"],
+                delta=cur_kpis["ecs_ready"] - base_kpis["ecs_ready"],
+            )
+            c3.metric(
+                "Not ECS Ready",
+                cur_kpis["not_ecs_ready"],
+                delta=cur_kpis["not_ecs_ready"] - base_kpis["not_ecs_ready"],
+                delta_color="inverse",
+            )
+            c4.metric(
+                "Schema Drift",
+                cur_kpis["schema_drift"],
+                delta=cur_kpis["schema_drift"] - base_kpis["schema_drift"],
+                delta_color="inverse",
+            )
+            c5.metric(
+                "Type Conflicts",
+                cur_kpis["type_conflicts"],
+                delta=cur_kpis["type_conflicts"] - base_kpis["type_conflicts"],
+                delta_color="inverse",
+            )
 
-        diff_df = _diff_readiness(base_ready, readiness_df)
-        only_changes = st.checkbox("Show only added / removed / changed", value=True)
-        view = diff_df[diff_df["change"] != "unchanged"] if only_changes else diff_df
+            diff_df = _diff_readiness(base_ready, readiness_df)
+            only_changes = st.checkbox(
+                "Show only added / removed / changed", value=True
+            )
+            view = (
+                diff_df[diff_df["change"] != "unchanged"] if only_changes else diff_df
+            )
 
-        st.markdown("##### Per-project deltas")
-        st.dataframe(
-            view,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "project_prefix": st.column_config.TextColumn("Project", width="medium"),
-                "change": st.column_config.TextColumn("Change", width="small"),
-                "stage_fields_Δ": st.column_config.NumberColumn(
-                    "Stage Fields Δ", format="%+d"
-                ),
-                "beta_fields_Δ": st.column_config.NumberColumn(
-                    "Beta Fields Δ", format="%+d"
-                ),
-                "ecs_fields_Δ": st.column_config.NumberColumn(
-                    "ECS Fields Δ", format="%+d"
-                ),
-                "type_mismatches_Δ": st.column_config.NumberColumn(
-                    "Type Mismatches Δ", format="%+d"
-                ),
-                "stage_docs_Δ": st.column_config.NumberColumn(
-                    "Stage Docs Δ", format="%+d"
-                ),
-                "beta_docs_Δ": st.column_config.NumberColumn(
-                    "Beta Docs Δ", format="%+d"
-                ),
-                "format_old": st.column_config.TextColumn("Format (baseline)"),
-                "format_new": st.column_config.TextColumn("Format (current)"),
-            },
-        )
+            st.markdown("##### Per-project deltas")
+            st.dataframe(
+                view,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "project_prefix": st.column_config.TextColumn(
+                        "Project", width="medium"
+                    ),
+                    "change": st.column_config.TextColumn("Change", width="small"),
+                    "stage_fields_Δ": st.column_config.NumberColumn(
+                        "Stage Fields Δ", format="%+d"
+                    ),
+                    "beta_fields_Δ": st.column_config.NumberColumn(
+                        "Beta Fields Δ", format="%+d"
+                    ),
+                    "ecs_fields_Δ": st.column_config.NumberColumn(
+                        "ECS Fields Δ", format="%+d"
+                    ),
+                    "type_mismatches_Δ": st.column_config.NumberColumn(
+                        "Type Mismatches Δ", format="%+d"
+                    ),
+                    "stage_docs_Δ": st.column_config.NumberColumn(
+                        "Stage Docs Δ", format="%+d"
+                    ),
+                    "beta_docs_Δ": st.column_config.NumberColumn(
+                        "Beta Docs Δ", format="%+d"
+                    ),
+                    "format_old": st.column_config.TextColumn("Format (baseline)"),
+                    "format_new": st.column_config.TextColumn("Format (current)"),
+                },
+            )

@@ -15,6 +15,8 @@ x-app: &app
     DISCOVER_CLUSTER: ${DISCOVER_CLUSTER:-stage}
     # Optional: mic | mic,cd | mic-api,mic-ava  (empty = all)
     PREFIX_FILTER: ${PREFIX_FILTER:-}
+    # Optional: pin index calendar day YYYY-MM-DD (panel / CLI)
+    INDEX_DATE: ${INDEX_DATE:-}
     HOST_UID: ${HOST_UID:-}
     HOST_GID: ${HOST_GID:-}
   volumes:
@@ -41,24 +43,24 @@ services:
       discover-prefixes:
         condition: service_completed_successfully
 
-  # Streamlit dashboard for dated result runs (does not join the one-shot pipeline)
+  # Streamlit dashboard — pick an index day and fetch from ES
   panel:
-    build: .
-    image: es-mapping-tools:latest
-    pull_policy: build
+    <<: *app
     container_name: efk-schema-panel
     profiles: ["panel"]
     restart: unless-stopped
     command: ["panel"]
     environment:
-      # Always listen on 8501 inside the container; map host port via PANEL_PORT.
       STREAMLIT_SERVER_PORT: "8501"
       STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
       STREAMLIT_BROWSER_GATHERUSAGESTATS: "false"
       STREAMLIT_SERVER_HEADLESS: "true"
+      ENABLE_BETA: ${ENABLE_BETA:-false}
+      ES_VERIFY_CERTS: ${ES_VERIFY_CERTS:-false}
+      PREFIX_FILTER: ${PREFIX_FILTER:-}
     volumes:
-      - ./results:/app/results:ro
+      - ./results:/app/results
+      - ./prefixes.json:/app/prefixes.json:ro
+      - ./.env:/app/.env:ro
       - ./app.py:/app/app.py:ro
-    ports:
-      - "${PANEL_PORT:-8501}:8501"
-    entrypoint: ["/docker-entrypoint.sh"]
+      - ./compare_es_mappings.py:/app/compare_es_mappings.py:ro
