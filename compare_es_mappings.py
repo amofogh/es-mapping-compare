@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-Compare Elasticsearch index field mappings between Beta and Stage clusters.
+Analyze Elasticsearch index field mappings on the ELK cluster.
 
 Resolves the latest date-based index per project prefix (prefers today's
 ``<prefix>-logs-YYYY.MM.DD``, then ``<prefix>-YYYY.MM.DD``, then wildcard
-fallback), flattens mappings, detects schema drift, checks ECS compliance,
-tags Fluentd log-format archetypes, and exports CSV reports for central log
+fallback), flattens mappings, checks ECS compliance, tags Fluentd
+log-format archetypes, and exports CSV/YAML reports for central log
 format standardization.
 
 Usage:
   # 1) Discover / merge live prefixes into prefixes.json
   python discover_prefixes.py
 
-  # 2) Review/edit prefixes.json, then compare mappings
-  ENABLE_BETA=false python compare_es_mappings.py
-
-  # Stage-only (default): ENABLE_BETA=false
-  # Both clusters:       ENABLE_BETA=true
+  # 2) Review/edit prefixes.json, then analyze cluster mappings
+  python compare_es_mappings.py
+  INDEX_DATE=2026-07-28 python compare_es_mappings.py
 
 Outputs (under ``results/<run_id>/``):
   - mapping_comparison.json
@@ -26,8 +24,8 @@ Outputs (under ``results/<run_id>/``):
   - all_index_mappings.yaml
   - index_mappings/<prefix>.yaml
 
-Each compare run writes a unique dated folder (``YYYY-MM-DD_HHMMSS``) so
-previous runs are kept for side-by-side comparison. ``results/latest`` is a
+Each run writes a unique dated folder (``YYYY-MM-DD_HHMMSS``) so previous
+runs are kept for side-by-side comparison. ``results/latest`` is a
 symlink to the most recent run. Override the folder name with ``RESULTS_RUN``.
 """
 
@@ -212,70 +210,6 @@ def load_core_domain_prefixes(path: Optional[Path] = None) -> List[str]:
         if str(p).strip()
     ]
     return sorted(set(domains)) or ["ams", "ats", "cd", "ecs", "hrm", "ime", "mic", "oms"]
-
-
-def load_beta_prefix_aliases(path: Optional[Path] = None) -> Dict[str, str]:
-    """
-    Load Stage→Beta service prefix aliases from prefixes.json.
-
-    Beta often uses ``<team>-beta-<app>`` (e.g. ``mic-beta-ava``) while Stage
-    uses ``<team>-<app>`` (``mic-ava``), and may consolidate many Stage
-    services into one Beta stream (all ``mic-iss.*`` → ``mic-beta-iss``).
-    """
-    prefixes_path = path or PREFIXES_FILE
-    if not prefixes_path.is_file():
-        return {}
-    try:
-        with open(prefixes_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    raw = data.get("beta_prefix_aliases") or {}
-    if not isinstance(raw, dict):
-        return {}
-    return {
-        str(k).strip(): str(v).strip()
-        for k, v in raw.items()
-        if str(k).strip() and str(v).strip()
-    }
-
-
-def beta_prefix_candidates(
-    stage_prefix: str,
-    aliases: Optional[Dict[str, str]] = None,
-) -> List[str]:
-    """
-    Ordered Beta lookup prefixes for a Stage service prefix.
-
-    1. Explicit alias from ``beta_prefix_aliases``
-    2. Auto ``team-beta-rest`` (mic-ava → mic-beta-ava)
-    3. Collapsed ``team-beta-head`` (mic-iss.webapi → mic-beta-iss)
-    4. Exact Stage name (in case naming matches)
-    """
-    aliases = aliases if aliases is not None else load_beta_prefix_aliases()
-    prefix = (stage_prefix or "").strip()
-    if not prefix:
-        return []
-
-    ordered: List[str] = []
-
-    def _add(name: str) -> None:
-        name = name.strip()
-        if name and name not in ordered:
-            ordered.append(name)
-
-    if prefix in aliases:
-        _add(aliases[prefix])
-
-    if "-" in prefix:
-        team, rest = prefix.split("-", 1)
-        _add(f"{team}-beta-{rest}")
-        head = rest.replace(".", "-").split("-", 1)[0]
-        if head:
-            _add(f"{team}-beta-{head}")
-
-    _add(prefix)
-    return ordered
 
 
 def core_team_of(prefix: str) -> str:
@@ -596,9 +530,6 @@ FIELD_COUNTS_CSV_FILE = str(RESULTS_DIR / "index_field_counts.csv")
 MAPPINGS_YAML_FILE = str(RESULTS_DIR / "all_index_mappings.yaml")
 MAPPINGS_YAML_DIR = str(RESULTS_DIR / "index_mappings")
 
-# Feature flag: when False, skip Beta entirely and run Stage-only mode.
-ENABLE_BETA = os.environ.get("ENABLE_BETA", "false").lower() in ("true", "1", "yes")
-
 # Date fragments commonly used in ILM / daily indices (YYYY.MM.DD, YYYY-MM-DD, etc.)
 _DATE_FRAGMENT_RE = re.compile(
     r"(?P<y>\d{4})[.\-_](?P<m>\d{2})[.\-_](?P<d>\d{2})"
@@ -631,23 +562,39 @@ def _parse_url_auth(url: str) -> Tuple[str, Optional[Tuple[str, str]]]:
     return url, None
 
 
+def _env_first(*names: str) -> Optional[str]:
+    for name in names:
+        val = os.environ.get(name)
+        if val is not None and str(val).strip() != "":
+            return val
+    return None
+
+
 def build_es_client(
-    url_env: str,
-    user_env: str,
-    password_env: str,
-    label: str,
+    url_env: str = "ES_URL",
+    user_env: str = "ES_USER",
+    password_env: str = "ES_PASSWORD",
+    label: str = "Elasticsearch",
     config: Optional[Dict[str, Any]] = None,
 ) -> Elasticsearch:
     """
     Build an Elasticsearch 7.x client from env vars and/or a config dict.
 
+    Defaults to ``ES_URL`` / ``ES_USER`` / ``ES_PASSWORD``. Falls back to
+    legacy ``STAGE_ES_*`` names when the new vars are unset.
     Precedence: config dict overrides environment variables.
     """
     cfg = config or {}
-    url = cfg.get("url") or os.environ.get(url_env)
+    legacy_url = "STAGE_ES_URL" if url_env == "ES_URL" else None
+    legacy_user = "STAGE_ES_USER" if user_env == "ES_USER" else None
+    legacy_password = "STAGE_ES_PASSWORD" if password_env == "ES_PASSWORD" else None
+
+    url = cfg.get("url") or _env_first(
+        url_env, *( [legacy_url] if legacy_url else [] )
+    )
     if not url:
         raise SystemExit(
-            f"Missing {label} Elasticsearch URL. "
+            f"Missing {label} URL. "
             f"Set {url_env} or pass it in the config dictionary."
         )
 
@@ -662,8 +609,12 @@ def build_es_client(
             url,
         )
 
-    user = cfg.get("user") or os.environ.get(user_env)
-    password = cfg.get("password") or os.environ.get(password_env)
+    user = cfg.get("user") or _env_first(
+        user_env, *( [legacy_user] if legacy_user else [] )
+    )
+    password = cfg.get("password") or _env_first(
+        password_env, *( [legacy_password] if legacy_password else [] )
+    )
     http_auth = None
     if user is not None and password is not None:
         http_auth = (user, password)
@@ -696,7 +647,7 @@ def _explain_transport_error(exc: BaseException) -> str:
     if status == 302 or "TransportError(302" in text or "(302" in text:
         msg += (
             " — HTTP 302 usually means the URL points at Kibana (port 5601) "
-            "or another redirecting proxy. Set BETA_ES_URL / STAGE_ES_URL to "
+            "or another redirecting proxy. Set ES_URL to "
             "the Elasticsearch API endpoint (typically http://host:9200)."
         )
     return msg
@@ -787,34 +738,6 @@ def resolve_latest_index(
     return None
 
 
-def resolve_latest_index_beta(
-    es: Elasticsearch,
-    stage_prefix: str,
-    aliases: Optional[Dict[str, str]] = None,
-    as_of: Optional[date] = None,
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Resolve Beta index for a Stage service prefix.
-
-    Tries alias / ``team-beta-*`` candidates. Returns
-    ``(resolved_index, beta_prefix_used)``.
-    """
-    for candidate in beta_prefix_candidates(stage_prefix, aliases=aliases):
-        resolved = resolve_latest_index(
-            es, candidate, cluster_label="Beta", as_of=as_of
-        )
-        if resolved:
-            if candidate != stage_prefix:
-                logger.info(
-                    "Prefix '%s': Beta alias '%s' -> %s",
-                    stage_prefix,
-                    candidate,
-                    resolved,
-                )
-            return resolved, candidate
-    return None, None
-
-
 _INDEX_DAY_RE = re.compile(r"(?:^|-)(\d{4})\.(\d{2})\.(\d{2})(?:$|-)")
 
 
@@ -855,15 +778,15 @@ def list_available_index_dates(
     return sorted(found, reverse=True)
 
 
-def count_stage_indices_for_day(
-    stage: Elasticsearch,
+def count_indices_for_day(
+    es: Elasticsearch,
     prefixes: List[str],
     as_of: date,
 ) -> int:
-    """How many prefixes have a Stage index for the pinned calendar day."""
+    """How many prefixes have an index for the pinned calendar day."""
     hits = 0
     for prefix in prefixes:
-        if resolve_latest_index(stage, prefix, cluster_label="Stage", as_of=as_of):
+        if resolve_latest_index(es, prefix, cluster_label="ES", as_of=as_of):
             hits += 1
     return hits
 
@@ -1173,61 +1096,89 @@ def fetch_index_size_stats(
 
 def attach_index_size_stats(
     entry: Dict[str, Any],
-    beta: Optional[Elasticsearch],
-    stage: Elasticsearch,
-    beta_enabled: bool,
+    es: Elasticsearch,
 ) -> None:
-    """Populate ``stage_size`` / ``beta_size`` on a compare result entry."""
-    stage_index = entry.get("stage_index")
-    entry["stage_size"] = (
-        fetch_index_size_stats(stage, stage_index)
-        if stage_index
+    """Populate ``index_size`` on an analysis result entry."""
+    index_name = entry_index_name(entry)
+    entry["index_size"] = (
+        fetch_index_size_stats(es, index_name)
+        if index_name
         else empty_index_size_stats()
     )
 
-    if not beta_enabled or beta is None:
-        entry["beta_size"] = empty_index_size_stats()
-        return
-
-    beta_index = entry.get("beta_index")
-    if beta_index and beta_index != "DISABLED":
-        entry["beta_size"] = fetch_index_size_stats(beta, beta_index)
-    else:
-        entry["beta_size"] = empty_index_size_stats()
-
 
 # ---------------------------------------------------------------------------
-# Comparison & ECS checks
+# ECS analysis helpers
 # ---------------------------------------------------------------------------
 
-def compare_fields(
-    beta_fields: Dict[str, str],
-    stage_fields: Dict[str, str],
+def entry_index_name(entry: Dict[str, Any]) -> Optional[str]:
+    """Resolved index name (supports legacy ``stage_index``)."""
+    return entry.get("index_name") or entry.get("stage_index")
+
+
+def entry_fields(entry: Dict[str, Any]) -> Dict[str, str]:
+    """Mapped fields dict (supports legacy ``stage_fields``)."""
+    fields = entry.get("fields")
+    if fields is None:
+        fields = entry.get("stage_fields")
+    return fields or {}
+
+
+def entry_index_size(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Index size stats (supports legacy ``stage_size``)."""
+    size = entry.get("index_size")
+    if size is None:
+        size = entry.get("stage_size")
+    return size or empty_index_size_stats()
+
+
+def normalize_ecs(ecs: Any) -> Dict[str, Any]:
+    """Normalize ecs payload (flat or legacy nested ``{"stage": ...}``)."""
+    if not isinstance(ecs, dict):
+        return {}
+    if "stage" in ecs and "ecs_ready" not in ecs:
+        nested = ecs.get("stage") or {}
+        return nested if isinstance(nested, dict) else {}
+    return ecs
+
+
+def missing_required_ecs_fields(ecs_info: Optional[Dict[str, Any]]) -> List[str]:
+    """Return core ECS field names that are not present (status != ecs)."""
+    if not ecs_info:
+        return list(ECS_FIELDS)
+    missing: List[str] = []
+    for field, detail in (ecs_info.get("fields") or {}).items():
+        if (detail or {}).get("status") != "ecs":
+            missing.append(field)
+    return missing
+
+
+def field_issues(
+    fields: Dict[str, str],
+    ecs_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    beta_keys = set(beta_fields)
-    stage_keys = set(stage_fields)
-
-    missing_in_stage = sorted(beta_keys - stage_keys)
-    missing_in_beta = sorted(stage_keys - beta_keys)
-
-    type_mismatches = []
-    for key in sorted(beta_keys & stage_keys):
-        b_type, s_type = beta_fields[key], stage_fields[key]
-        if b_type != s_type:
-            type_mismatches.append(
+    """Cluster schema issues (missing required ECS fields, legacy aliases)."""
+    ecs_info = ecs_info or (check_ecs_compliance(fields) if fields else None)
+    missing_ecs = missing_required_ecs_fields(ecs_info) if fields else list(ECS_FIELDS)
+    legacy_found: List[Dict[str, Any]] = []
+    for field, detail in ((ecs_info or {}).get("fields") or {}).items():
+        detail = detail or {}
+        if detail.get("status") == "legacy":
+            legacy_found.append(
                 {
-                    "field": key,
-                    "beta_type": b_type,
-                    "stage_type": s_type,
+                    "ecs_field": field,
+                    "legacy_alternatives": list(
+                        detail.get("legacy_alternatives_found") or []
+                    ),
                 }
             )
 
     return {
-        "missing_in_stage": missing_in_stage,
-        "missing_in_beta": missing_in_beta,
-        "type_mismatches": type_mismatches,
-        "beta_field_count": len(beta_fields),
-        "stage_field_count": len(stage_fields),
+        "field_count": len(fields),
+        "missing_ecs_fields": missing_ecs,
+        "legacy_ecs_alternatives": legacy_found,
+        "ecs_fields_present": (ecs_info or {}).get("ecs_fields_present", 0),
+        "ecs_fields_total": (ecs_info or {}).get("ecs_fields_total", len(ECS_FIELDS)),
     }
 
 
@@ -1272,189 +1223,93 @@ def check_ecs_compliance(fields: Dict[str, str]) -> Dict[str, Any]:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def compare_clusters(
-    beta: Optional[Elasticsearch],
-    stage: Elasticsearch,
+def analyze_cluster(
+    es: Elasticsearch,
     prefixes: Optional[List[str]] = None,
-    enable_beta: Optional[bool] = None,
     as_of: Optional[date] = None,
 ) -> Dict[str, Any]:
+    """Resolve cluster indices, flatten mappings, and score ECS readiness."""
     prefixes = prefixes or CORE_INDEX_PREFIXES
-    beta_enabled = ENABLE_BETA if enable_beta is None else enable_beta
     results: List[Dict[str, Any]] = []
-    beta_aliases = load_beta_prefix_aliases() if beta_enabled else {}
     index_day = index_date_label(as_of) if as_of is not None else None
 
     for prefix in prefixes:
         entry: Dict[str, Any] = {
             "prefix": prefix,
-            "beta_index": "DISABLED" if not beta_enabled else None,
-            "beta_prefix": None,
-            "stage_index": None,
+            "index_name": None,
             "status": "ok",
             "error": None,
-            "comparison": None,
-            "ecs": {"beta": None, "stage": None},
+            "issues": None,
+            "ecs": None,
             "has_schema_drift": False,
-            "has_type_mismatch": False,
-            "beta_fields": {},
-            "stage_fields": {},
-            "beta_disabled": not beta_enabled,
-            "stage_size": empty_index_size_stats(),
-            "beta_size": empty_index_size_stats(),
+            "has_ecs_gaps": False,
+            "fields": {},
+            "index_size": empty_index_size_stats(),
         }
 
         try:
-            beta_prefix_used: Optional[str] = None
-            if beta_enabled:
-                if beta is None:
-                    raise RuntimeError("ENABLE_BETA is True but Beta client is None")
-                beta_index, beta_prefix_used = resolve_latest_index_beta(
-                    beta, prefix, aliases=beta_aliases, as_of=as_of
-                )
-            else:
-                beta_index = "DISABLED"
-
-            stage_index = resolve_latest_index(
-                stage, prefix, cluster_label="Stage", as_of=as_of
+            index_name = resolve_latest_index(
+                es, prefix, cluster_label="ES", as_of=as_of
             )
-            entry["beta_index"] = beta_index
-            entry["beta_prefix"] = beta_prefix_used
-            entry["stage_index"] = stage_index
+            entry["index_name"] = index_name
 
-            if beta_enabled and not beta_index:
-                tried = ", ".join(beta_prefix_candidates(prefix, beta_aliases))
+            if not index_name:
                 logger.warning(
-                    "Prefix '%s': MISSING on Beta (tried: %s) — CSV will use MISSING/N/A for Beta",
-                    prefix,
-                    tried,
-                )
-            if not stage_index:
-                logger.warning(
-                    "Prefix '%s': MISSING on Stage — CSV will use MISSING/N/A for Stage",
+                    "Prefix '%s': MISSING on ES cluster — CSV will use MISSING/N/A",
                     prefix,
                 )
-
-            beta_fields: Dict[str, str] = {}
-            stage_fields: Dict[str, str] = {}
-
-            if beta_enabled and beta_index and beta_index != "DISABLED":
-                beta_fields = fetch_flattened_mapping(beta, beta_index)
-            if stage_index:
-                stage_fields = fetch_flattened_mapping(stage, stage_index)
-
-            entry["beta_fields"] = beta_fields
-            entry["stage_fields"] = stage_fields
-
-            if not beta_enabled:
-                # Stage-only mode: never treat disabled Beta as drift/failure.
-                if not stage_index:
-                    entry["status"] = "missing_stage"
-                    entry["error"] = f"No index matching '{prefix}-*' on Stage"
-                    entry["has_schema_drift"] = True
-                    entry["comparison"] = compare_fields({}, stage_fields)
-                    entry["ecs"] = {
-                        "beta": None,
-                        "stage": check_ecs_compliance(stage_fields) if stage_fields else None,
-                    }
-                    attach_index_size_stats(entry, beta, stage, beta_enabled)
-                    results.append(entry)
-                    continue
-
-                entry["comparison"] = {
-                    "missing_in_stage": [],
-                    "missing_in_beta": [],
-                    "type_mismatches": [],
-                    "beta_field_count": 0,
-                    "stage_field_count": len(stage_fields),
-                    "beta_disabled": True,
-                }
-                entry["ecs"] = {
-                    "beta": None,
-                    "stage": check_ecs_compliance(stage_fields) if stage_fields else None,
-                }
-                entry["has_type_mismatch"] = False
-                entry["has_schema_drift"] = False
-                attach_index_size_stats(entry, beta, stage, beta_enabled)
+                entry["status"] = "missing_index"
+                entry["error"] = f"No index matching '{prefix}-*' on ES cluster"
+                entry["has_schema_drift"] = True
+                entry["has_ecs_gaps"] = True
+                entry["issues"] = field_issues({})
+                entry["ecs"] = None
+                attach_index_size_stats(entry, es)
                 results.append(entry)
                 continue
 
-            if not beta_index and not stage_index:
-                entry["status"] = "missing_both"
-                entry["error"] = f"No index matching '{prefix}-*' on Beta or Stage"
-                entry["has_schema_drift"] = True
-                attach_index_size_stats(entry, beta, stage, beta_enabled)
-                results.append(entry)
-                continue
-
-            if not beta_index:
-                tried = ", ".join(beta_prefix_candidates(prefix, beta_aliases))
-                entry["status"] = "missing_beta"
-                entry["error"] = (
-                    f"No Beta index for '{prefix}' (tried: {tried})"
-                )
-                entry["has_schema_drift"] = True
-            elif not stage_index:
-                entry["status"] = "missing_stage"
-                entry["error"] = f"No index matching '{prefix}-*' on Stage"
-                entry["has_schema_drift"] = True
-
-            comparison = compare_fields(beta_fields, stage_fields)
-            entry["comparison"] = comparison
-            entry["ecs"] = {
-                "beta": check_ecs_compliance(beta_fields) if beta_fields else None,
-                "stage": check_ecs_compliance(stage_fields) if stage_fields else None,
-            }
-            entry["has_type_mismatch"] = bool(comparison["type_mismatches"])
-            if entry["status"] == "ok":
-                entry["has_schema_drift"] = bool(
-                    comparison["missing_in_stage"]
-                    or comparison["missing_in_beta"]
-                    or comparison["type_mismatches"]
-                )
-            else:
-                entry["has_schema_drift"] = True
+            fields = fetch_flattened_mapping(es, index_name)
+            entry["fields"] = fields
+            ecs_info = check_ecs_compliance(fields) if fields else None
+            entry["ecs"] = ecs_info
+            issues = field_issues(fields, ecs_info=ecs_info)
+            entry["issues"] = issues
+            entry["has_ecs_gaps"] = bool(issues.get("missing_ecs_fields"))
+            entry["has_schema_drift"] = entry["has_ecs_gaps"]
         except Exception as exc:  # noqa: BLE001 — surface per-prefix failures
             entry["status"] = "error"
             entry["error"] = _explain_transport_error(exc)
             entry["has_schema_drift"] = True
+            entry["has_ecs_gaps"] = True
             logger.exception("Prefix '%s' failed: %s", prefix, exc)
 
-        attach_index_size_stats(entry, beta, stage, beta_enabled)
+        attach_index_size_stats(entry, es)
         results.append(entry)
 
     drifted = [r for r in results if r.get("has_schema_drift")]
-    mismatched = [r for r in results if r.get("has_type_mismatch")]
-    if beta_enabled:
-        ecs_not_ready = [
-            r
-            for r in results
-            if r.get("ecs", {}).get("beta")
-            and (
-                not r["ecs"]["beta"].get("ecs_ready")
-                or not (r["ecs"].get("stage") or {}).get("ecs_ready", False)
-            )
-        ]
-    else:
-        ecs_not_ready = [
-            r
-            for r in results
-            if r.get("stage_index")
-            and not ((r.get("ecs") or {}).get("stage") or {}).get("ecs_ready", False)
-        ]
+    ecs_not_ready = [
+        r
+        for r in results
+        if entry_index_name(r)
+        and not normalize_ecs(r.get("ecs")).get("ecs_ready", False)
+    ]
 
     return {
         "generated_at": _utc_now_iso(),
         "index_date": index_day or index_date_label(as_of or _utc_now().date()),
         "index_date_pinned": as_of is not None,
-        "enable_beta": beta_enabled,
-        "mode": "beta_and_stage" if beta_enabled else "stage_only",
+        "mode": "cluster",
         "prefixes_total": len(prefixes),
         "prefixes_with_schema_drift": len(drifted),
-        "prefixes_with_type_mismatches": len(mismatched),
+        "prefixes_with_ecs_gaps": len(ecs_not_ready),
         "prefixes_not_ecs_ready": len(ecs_not_ready),
         "results": results,
     }
+
+
+# Back-compat aliases
+compare_clusters = analyze_cluster
+analyze_stage_cluster = analyze_cluster
 
 
 # ---------------------------------------------------------------------------
@@ -1465,17 +1320,6 @@ def _bool_csv(value: bool) -> str:
     return "TRUE" if value else "FALSE"
 
 
-def _primary_size_stats(entry: Dict[str, Any]) -> Dict[str, Any]:
-    """Prefer Stage size stats; fall back to Beta."""
-    stage_size = entry.get("stage_size") or empty_index_size_stats()
-    if entry.get("stage_index") not in (None, "MISSING"):
-        return stage_size
-    beta_size = entry.get("beta_size") or empty_index_size_stats()
-    if entry.get("beta_index") not in (None, "MISSING", "DISABLED"):
-        return beta_size
-    return stage_size
-
-
 def export_mappings_to_csv(
     report: Dict[str, Any],
     csv_path: str = MAPPINGS_CSV_FILE,
@@ -1483,69 +1327,44 @@ def export_mappings_to_csv(
     """
     Flatten field mappings into ``all_index_mappings.csv``.
 
-    Required columns:
-      project_prefix, field_name, stage_resolved_index, stage_data_type, is_ecs_standard
-
-    When Beta is enabled, also includes beta_* / mismatch helper columns.
+    Columns:
+      project_prefix, field_name, resolved_index, data_type, is_ecs_standard
     """
-    beta_enabled = bool(report.get("enable_beta", ENABLE_BETA))
     fieldnames = [
         "project_prefix",
         "field_name",
-        "stage_resolved_index",
-        "stage_data_type",
+        "resolved_index",
+        "data_type",
         "is_ecs_standard",
     ]
-    if beta_enabled:
-        fieldnames[2:2] = ["beta_resolved_index", "beta_data_type"]
-        fieldnames.extend(["is_type_mismatch", "exists_in_both_envs"])
 
     rows: List[Dict[str, str]] = []
     for entry in report.get("results") or []:
         prefix = entry.get("prefix") or ""
-        beta_disabled = (not beta_enabled) or entry.get("beta_disabled") or (
-            entry.get("beta_index") == "DISABLED"
-        )
-        beta_index = "DISABLED" if beta_disabled else (entry.get("beta_index") or "MISSING")
-        stage_index = entry.get("stage_index") or "MISSING"
-        beta_fields: Dict[str, str] = {} if beta_disabled else (entry.get("beta_fields") or {})
-        stage_fields: Dict[str, str] = entry.get("stage_fields") or {}
+        index_name = entry_index_name(entry) or "MISSING"
+        fields = entry_fields(entry)
 
-        all_fields = sorted(set(beta_fields) | set(stage_fields))
-
-        def _row(field_name: str, stage_type: Optional[str], beta_type: Optional[str]) -> Dict[str, str]:
-            row = {
-                "project_prefix": prefix,
-                "field_name": field_name,
-                "stage_resolved_index": stage_index,
-                "stage_data_type": stage_type if stage_type is not None else "N/A",
-                "is_ecs_standard": _bool_csv(
-                    False if field_name == "N/A" else is_ecs_standard_field(field_name)
-                ),
-            }
-            if beta_enabled:
-                exists_both = beta_type is not None and stage_type is not None
-                row["beta_resolved_index"] = beta_index
-                row["beta_data_type"] = (
-                    "N/A" if beta_disabled or beta_type is None else beta_type
-                )
-                row["is_type_mismatch"] = _bool_csv(
-                    bool(exists_both and beta_type != stage_type)
-                )
-                row["exists_in_both_envs"] = _bool_csv(bool(exists_both))
-            return row
-
-        if not all_fields:
-            rows.append(_row("N/A", None, None))
+        if not fields:
+            rows.append(
+                {
+                    "project_prefix": prefix,
+                    "field_name": "N/A",
+                    "resolved_index": index_name,
+                    "data_type": "N/A",
+                    "is_ecs_standard": _bool_csv(False),
+                }
+            )
             continue
 
-        for field_name in all_fields:
+        for field_name in sorted(fields):
             rows.append(
-                _row(
-                    field_name,
-                    stage_fields.get(field_name),
-                    None if beta_disabled else beta_fields.get(field_name),
-                )
+                {
+                    "project_prefix": prefix,
+                    "field_name": field_name,
+                    "resolved_index": index_name,
+                    "data_type": fields[field_name],
+                    "is_ecs_standard": _bool_csv(is_ecs_standard_field(field_name)),
+                }
             )
 
     Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1566,116 +1385,51 @@ def export_central_format_readiness_csv(
     """
     Per-prefix gap analysis for central log format standardization.
 
-    When Beta is enabled, ``can_centralize_as_is`` requires both envs, zero type
-    mismatches, and core ECS fields on both sides with data.
-
-    When Beta is disabled, readiness is based purely on Stage mapping validity
-    and Stage ECS compliance.
+    Readiness is based on mapping validity and ECS compliance.
     """
     fieldnames = [
         "project_prefix",
         "core_team",
-        "total_fields_beta",
-        "total_fields_stage",
-        "common_fields_count",
-        "type_mismatches_count",
+        "total_fields",
         "ecs_compliant_fields_count",
+        "missing_ecs_fields_count",
         "can_centralize_as_is",
         "target_log_format",
-        "stage_docs",
-        "stage_index_size",
-        "stage_avg_log_size",
-        "beta_docs",
-        "beta_index_size",
-        "beta_avg_log_size",
+        "docs_count",
+        "index_size",
+        "avg_log_size",
     ]
 
-    beta_enabled = bool(report.get("enable_beta", ENABLE_BETA))
     rows: List[Dict[str, Any]] = []
     for entry in report.get("results") or []:
         prefix = entry.get("prefix") or ""
-        beta_disabled = (not beta_enabled) or entry.get("beta_disabled") or (
-            entry.get("beta_index") == "DISABLED"
-        )
-        beta_fields: Dict[str, str] = {} if beta_disabled else (entry.get("beta_fields") or {})
-        stage_fields: Dict[str, str] = entry.get("stage_fields") or {}
-        beta_keys = set(beta_fields)
-        stage_keys = set(stage_fields)
-        common = beta_keys & stage_keys
+        fields = entry_fields(entry)
+        ecs_info = normalize_ecs(entry.get("ecs"))
+        issues = entry.get("issues") or field_issues(fields, ecs_info=ecs_info)
+        missing_ecs = issues.get("missing_ecs_fields") or []
+        ecs_compliant = sum(1 for f in fields if is_ecs_standard_field(f))
 
-        comparison = entry.get("comparison") or {}
-        mismatches = comparison.get("type_mismatches") or []
-        # Recompute if comparison was skipped
-        if entry.get("comparison") is None and not beta_disabled:
-            mismatches = [
-                k for k in common if beta_fields[k] != stage_fields[k]
-            ]
-        if beta_disabled:
-            mismatches = []
-
-        # ECS-compliant = union fields that match ECS standard paths
-        union_fields = beta_keys | stage_keys
-        ecs_compliant = sum(1 for f in union_fields if is_ecs_standard_field(f))
-
-        beta_ecs = (entry.get("ecs") or {}).get("beta")
-        stage_ecs = (entry.get("ecs") or {}).get("stage")
-
-        # Archetype is based on Stage (primary planning source); fall back to Beta.
-        archetype_fields = stage_fields or beta_fields
-        archetype_ecs = stage_ecs or beta_ecs
         target_log_format = classify_log_format_archetype(
-            archetype_fields, ecs_info=archetype_ecs
+            fields, ecs_info=ecs_info or None
         )
 
-        if beta_disabled:
-            stage_present = bool(entry.get("stage_index"))
-            stage_ecs_ok = bool(stage_ecs and stage_ecs.get("ecs_ready"))
-            can_centralize = stage_present and bool(stage_fields) and stage_ecs_ok
-        else:
-            core_ecs_ok = True
-            if beta_fields:
-                core_ecs_ok = core_ecs_ok and bool(beta_ecs and beta_ecs.get("ecs_ready"))
-            if stage_fields:
-                core_ecs_ok = core_ecs_ok and bool(stage_ecs and stage_ecs.get("ecs_ready"))
-            if not beta_fields and not stage_fields:
-                core_ecs_ok = False
+        present = bool(entry_index_name(entry))
+        ecs_ok = bool(ecs_info and ecs_info.get("ecs_ready"))
+        can_centralize = present and bool(fields) and ecs_ok
 
-            both_envs_present = bool(
-                entry.get("beta_index")
-                and entry.get("beta_index") != "DISABLED"
-                and entry.get("stage_index")
-            )
-            can_centralize = (
-                both_envs_present
-                and len(mismatches) == 0
-                and core_ecs_ok
-            )
-
-        stage_size = entry.get("stage_size") or empty_index_size_stats()
-        beta_size = entry.get("beta_size") or empty_index_size_stats()
+        size = entry_index_size(entry)
         rows.append(
             {
                 "project_prefix": prefix,
                 "core_team": core_team_of(prefix),
-                "total_fields_beta": 0 if beta_disabled else len(beta_fields),
-                "total_fields_stage": len(stage_fields),
-                "common_fields_count": 0 if beta_disabled else len(common),
-                "type_mismatches_count": 0 if beta_disabled else len(mismatches),
+                "total_fields": len(fields),
                 "ecs_compliant_fields_count": ecs_compliant,
+                "missing_ecs_fields_count": len(missing_ecs),
                 "can_centralize_as_is": _bool_csv(can_centralize),
                 "target_log_format": target_log_format,
-                "stage_docs": stage_size.get("docs_count", 0),
-                "stage_index_size": stage_size.get("store_size") or "0b",
-                "stage_avg_log_size": stage_size.get("avg_log_size") or "",
-                "beta_docs": ""
-                if beta_disabled
-                else beta_size.get("docs_count", 0),
-                "beta_index_size": ""
-                if beta_disabled
-                else (beta_size.get("store_size") or "0b"),
-                "beta_avg_log_size": ""
-                if beta_disabled
-                else (beta_size.get("avg_log_size") or ""),
+                "docs_count": size.get("docs_count", 0),
+                "index_size": size.get("store_size") or "0b",
+                "avg_log_size": size.get("avg_log_size") or "",
             }
         )
 
@@ -1694,78 +1448,29 @@ def export_index_field_counts_csv(
     report: Dict[str, Any],
     csv_path: str = FIELD_COUNTS_CSV_FILE,
 ) -> str:
-    """
-    Per-service summary: Stage vs Beta index size and field counts.
-
-    Human-readable sizes only (no duplicate primary/stage columns, no raw bytes).
-    """
+    """Per-service summary: index size and field counts (human-readable sizes)."""
     fieldnames = [
         "service",
         "team",
         "log_format",
-        "stage_index",
-        "stage_fields",
-        "stage_docs",
-        "stage_index_size",
-        "stage_avg_log_size",
-        "beta_index",
-        "beta_prefix",
-        "beta_fields",
-        "beta_docs",
-        "beta_index_size",
-        "beta_avg_log_size",
-        "beta_status",
+        "index_name",
+        "field_count",
+        "docs_count",
+        "index_size",
+        "avg_log_size",
     ]
 
-    beta_enabled = bool(report.get("enable_beta", ENABLE_BETA))
     rows: List[Dict[str, Any]] = []
 
     for entry in report.get("results") or []:
         prefix = entry.get("prefix") or ""
-        beta_disabled = (not beta_enabled) or entry.get("beta_disabled") or (
-            entry.get("beta_index") == "DISABLED"
-        )
-        beta_fields: Dict[str, str] = {} if beta_disabled else (entry.get("beta_fields") or {})
-        stage_fields: Dict[str, str] = entry.get("stage_fields") or {}
+        fields = entry_fields(entry)
+        index_name = entry_index_name(entry) or ""
+        size = entry_index_size(entry)
+        ecs_info = normalize_ecs(entry.get("ecs"))
 
-        stage_index = entry.get("stage_index") or ""
-        beta_index = entry.get("beta_index") or ""
-        stage_size = entry.get("stage_size") or empty_index_size_stats()
-        beta_size = (
-            empty_index_size_stats()
-            if beta_disabled
-            else (entry.get("beta_size") or empty_index_size_stats())
-        )
-
-        if beta_disabled:
-            beta_status = "disabled"
-            beta_index_out = "DISABLED"
-            beta_prefix_out = ""
-            beta_fields_n = ""
-            beta_docs = ""
-            beta_index_size = ""
-            beta_avg = ""
-        elif not beta_index or beta_index == "MISSING":
-            beta_status = "missing"
-            beta_index_out = ""
-            beta_prefix_out = ""
-            beta_fields_n = ""
-            beta_docs = ""
-            beta_index_size = ""
-            beta_avg = ""
-        else:
-            beta_status = "ok"
-            beta_index_out = beta_index
-            beta_prefix_out = entry.get("beta_prefix") or ""
-            beta_fields_n = len(beta_fields)
-            beta_docs = beta_size.get("docs_count", 0)
-            beta_index_size = beta_size.get("store_size") or "0b"
-            beta_avg = beta_size.get("avg_log_size") or ""
-
-        stage_ecs = (entry.get("ecs") or {}).get("stage")
-        beta_ecs = (entry.get("ecs") or {}).get("beta")
         target_log_format = classify_log_format_archetype(
-            stage_fields or beta_fields, ecs_info=stage_ecs or beta_ecs
+            fields, ecs_info=ecs_info or None
         )
 
         rows.append(
@@ -1773,25 +1478,12 @@ def export_index_field_counts_csv(
                 "service": prefix,
                 "team": core_team_of(prefix),
                 "log_format": target_log_format,
-                "stage_index": stage_index or "",
-                "stage_fields": len(stage_fields) if stage_index else "",
-                "stage_docs": stage_size.get("docs_count", 0) if stage_index else "",
-                "stage_index_size": (stage_size.get("store_size") or "0b")
-                if stage_index
-                else "",
-                "stage_avg_log_size": (stage_size.get("avg_log_size") or "")
-                if stage_index
-                else "",
-                "beta_index": beta_index_out,
-                "beta_prefix": beta_prefix_out,
-                "beta_fields": beta_fields_n,
-                "beta_docs": beta_docs,
-                "beta_index_size": beta_index_size,
-                "beta_avg_log_size": beta_avg,
-                "beta_status": beta_status,
-                "_sort_bytes": int(stage_size.get("store_size_bytes") or 0)
-                if stage_index
-                else 0,
+                "index_name": index_name or "",
+                "field_count": len(fields) if index_name else "",
+                "docs_count": size.get("docs_count", 0) if index_name else "",
+                "index_size": (size.get("store_size") or "0b") if index_name else "",
+                "avg_log_size": (size.get("avg_log_size") or "") if index_name else "",
+                "_sort_bytes": int(size.get("store_size_bytes") or 0) if index_name else 0,
             }
         )
 
@@ -1810,37 +1502,24 @@ def export_index_field_counts_csv(
     return abs_path
 
 
-def _build_prefix_yaml_entry(entry: Dict[str, Any], beta_enabled: bool) -> Dict[str, Any]:
-    """
-    Human-readable per-service YAML from live ES mappings.
+def _build_prefix_yaml_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Human-readable per-service YAML from live ES mappings."""
+    fields = entry_fields(entry)
+    ecs_info = normalize_ecs(entry.get("ecs"))
+    size = entry_index_size(entry)
+    issues = entry.get("issues") or field_issues(fields, ecs_info=ecs_info or None)
 
-    ``fields`` under each env are exactly the flattened Elasticsearch mapping
-    types (same as ``GET /<index>/_mapping``). Diffs live under ``comparison``
-    instead of duplicating every field twice.
-    """
-    beta_disabled = (not beta_enabled) or entry.get("beta_disabled") or (
-        entry.get("beta_index") == "DISABLED"
-    )
-    beta_fields: Dict[str, str] = {} if beta_disabled else (entry.get("beta_fields") or {})
-    stage_fields: Dict[str, str] = entry.get("stage_fields") or {}
-    stage_ecs = (entry.get("ecs") or {}).get("stage")
-    beta_ecs = (entry.get("ecs") or {}).get("beta")
-    stage_size = entry.get("stage_size") or empty_index_size_stats()
-    beta_size = entry.get("beta_size") or empty_index_size_stats()
-
-    def _env_block(
-        *,
-        index: Optional[str],
-        fields: Dict[str, str],
-        size: Dict[str, Any],
-        ecs_info: Optional[Dict[str, Any]],
-        prefix: Optional[str] = None,
-        missing_label: str = "MISSING",
-    ) -> Dict[str, Any]:
-        if not index or index in ("MISSING", "DISABLED"):
-            return {"index": missing_label, "present": False}
-        block: Dict[str, Any] = {
-            "index": index,
+    index_name = entry_index_name(entry)
+    if not index_name or index_name in ("MISSING", "DISABLED"):
+        body: Dict[str, Any] = {
+            "log_format": classify_log_format_archetype(fields, ecs_info=ecs_info or None),
+            "index": "MISSING",
+            "present": False,
+        }
+    else:
+        body = {
+            "log_format": classify_log_format_archetype(fields, ecs_info=ecs_info or None),
+            "index": index_name,
             "present": True,
             "docs": size.get("docs_count", 0),
             "index_size": size.get("store_size") or "0b",
@@ -1851,66 +1530,15 @@ def _build_prefix_yaml_entry(entry: Dict[str, Any], beta_enabled: bool) -> Dict[
                 f"{(ecs_info or {}).get('ecs_fields_present', 0)}/"
                 f"{(ecs_info or {}).get('ecs_fields_total', 5)}"
             ),
-            # Exact ES mapping types for this index.
             "fields": {k: fields[k] for k in sorted(fields)},
         }
-        if prefix:
-            block["prefix"] = prefix
-        return block
 
-    archetype_fields = stage_fields or beta_fields
-    archetype_ecs = stage_ecs or beta_ecs
-    body: Dict[str, Any] = {
-        "log_format": classify_log_format_archetype(
-            archetype_fields, ecs_info=archetype_ecs
-        ),
-        "stage": _env_block(
-            index=entry.get("stage_index"),
-            fields=stage_fields,
-            size=stage_size,
-            ecs_info=stage_ecs,
-        ),
-    }
-
-    if beta_disabled:
-        body["beta"] = {"index": "DISABLED", "present": False}
-    else:
-        body["beta"] = _env_block(
-            index=entry.get("beta_index"),
-            fields=beta_fields,
-            size=beta_size,
-            ecs_info=beta_ecs,
-            prefix=entry.get("beta_prefix") or None,
-            missing_label="MISSING",
-        )
-
-    # Compact diff only (no full fields_by_env duplication).
-    if stage_fields and beta_fields:
-        stage_keys = set(stage_fields)
-        beta_keys = set(beta_fields)
-        only_stage = sorted(stage_keys - beta_keys)
-        only_beta = sorted(beta_keys - stage_keys)
-        type_mismatches = [
-            {
-                "field": name,
-                "stage_type": stage_fields[name],
-                "beta_type": beta_fields[name],
-            }
-            for name in sorted(stage_keys & beta_keys)
-            if stage_fields[name] != beta_fields[name]
-        ]
-        body["comparison"] = {
-            "common_fields": len(stage_keys & beta_keys),
-            "only_in_stage_count": len(only_stage),
-            "only_in_beta_count": len(only_beta),
-            "type_mismatch_count": len(type_mismatches),
-            "only_in_stage": only_stage,
-            "only_in_beta": only_beta,
-            "type_mismatches": type_mismatches,
-        }
-    elif entry.get("status") == "missing_beta":
-        body["comparison"] = {
-            "note": "No matching Beta index (check beta_prefix_aliases / shipping).",
+    missing_ecs = issues.get("missing_ecs_fields") or []
+    legacy = issues.get("legacy_ecs_alternatives") or []
+    if missing_ecs or legacy:
+        body["ecs_gaps"] = {
+            "missing_ecs_fields": missing_ecs,
+            "legacy_ecs_alternatives": legacy,
         }
 
     return body
@@ -1925,24 +1553,7 @@ def export_mappings_to_yaml(
     Export field mappings as YAML for easier reading.
 
     Writes:
-      - ``results/all_index_mappings.yaml`` — all prefixes in one file::
-
-            mic-myagah:
-              log_format: Format 3 (...)
-              stage:
-                index: mic-myagah-2026.08.01
-                docs: 41367
-                index_size: 24.8mb
-                avg_log_size: 628b
-                fields:          # exact ES mapping types
-                  "@timestamp": date
-              beta:
-                index: mic-beta-myagah-logs-2026.08.01
-                fields: ...
-              comparison:        # diffs only (not a full duplicate)
-                only_in_stage: [...]
-                type_mismatches: [...]
-
+      - ``results/all_index_mappings.yaml`` — all prefixes in one file
       - ``results/index_mappings/<prefix>.yaml`` — one file per prefix
     """
     if yaml is None:
@@ -1950,14 +1561,12 @@ def export_mappings_to_yaml(
             "PyYAML is required for YAML export. Install with: pip install pyyaml"
         )
 
-    beta_enabled = bool(report.get("enable_beta", ENABLE_BETA))
     combined: Dict[str, Any] = {}
 
     for entry in report.get("results") or []:
         prefix = entry.get("prefix") or "unknown"
-        combined[prefix] = _build_prefix_yaml_entry(entry, beta_enabled)
+        combined[prefix] = _build_prefix_yaml_entry(entry)
 
-    # Combined file
     Path(yaml_path).parent.mkdir(parents=True, exist_ok=True)
     with open(yaml_path, "w", encoding="utf-8") as fh:
         yaml.safe_dump(
@@ -1970,10 +1579,8 @@ def export_mappings_to_yaml(
         )
     abs_combined = os.path.abspath(yaml_path)
 
-    # Per-index files
     os.makedirs(per_index_dir, exist_ok=True)
     for prefix, body in combined.items():
-        # Safe filename: keep dots/dashes, replace path separators only
         safe_name = prefix.replace("/", "_").replace(os.sep, "_")
         single_path = os.path.join(per_index_dir, f"{safe_name}.yaml")
         with open(single_path, "w", encoding="utf-8") as fh:
@@ -2005,19 +1612,13 @@ def _hr(char: str = "=", width: int = 78) -> str:
 
 
 def print_cli_summary(report: Dict[str, Any]) -> None:
-    beta_enabled = bool(report.get("enable_beta", ENABLE_BETA))
     print(_hr())
-    if beta_enabled:
-        print(" Elasticsearch Mapping Comparison — Beta vs Stage")
-    else:
-        print(" Elasticsearch Mapping Comparison — Stage-only mode")
-        print(" [NOTICE] Beta cluster inspection is DISABLED. Running in Stage-only mode.")
+    print(" Elasticsearch Mapping Analysis")
     print(f" Generated: {report['generated_at']}")
     print(_hr())
     print(
         f" Prefixes scanned : {report['prefixes_total']}\n"
-        f" Schema drift     : {report['prefixes_with_schema_drift']}\n"
-        f" Type mismatches  : {report['prefixes_with_type_mismatches']}\n"
+        f" Schema issues    : {report['prefixes_with_schema_drift']}\n"
         f" Not ECS-ready    : {report['prefixes_not_ecs_ready']}"
     )
     print(_hr("-"))
@@ -2026,80 +1627,42 @@ def print_cli_summary(report: Dict[str, Any]) -> None:
         prefix = entry["prefix"]
         status = entry["status"]
         drift = entry.get("has_schema_drift")
-        mismatch = entry.get("has_type_mismatch")
+        ecs_info = normalize_ecs(entry.get("ecs"))
 
-        # Skip quiet, clean prefixes in the highlight section header logic
-        if status == "ok" and not drift and not mismatch:
-            beta_ecs = (entry.get("ecs") or {}).get("beta") or {}
-            stage_ecs = (entry.get("ecs") or {}).get("stage") or {}
-            if beta_enabled:
-                if beta_ecs.get("ecs_ready") and stage_ecs.get("ecs_ready"):
-                    continue
-            elif stage_ecs.get("ecs_ready"):
-                continue
+        if status == "ok" and not drift and ecs_info.get("ecs_ready"):
+            continue
 
         flags = []
-        if mismatch:
-            flags.append("TYPE MISMATCH")
-        if drift and not mismatch:
-            flags.append("SCHEMA DRIFT")
-        elif drift and mismatch:
-            flags.append("SCHEMA DRIFT")
+        if drift:
+            flags.append("SCHEMA ISSUES")
         if status not in {"ok"}:
             flags.append(status.upper())
-
-        beta_ecs = (entry.get("ecs") or {}).get("beta") or {}
-        stage_ecs = (entry.get("ecs") or {}).get("stage") or {}
-        if beta_enabled and beta_ecs and not beta_ecs.get("ecs_ready"):
-            flags.append("BETA !ECS")
-        if stage_ecs and not stage_ecs.get("ecs_ready"):
-            flags.append("STAGE !ECS")
+        if ecs_info and not ecs_info.get("ecs_ready"):
+            flags.append("!ECS")
 
         flag_str = " | ".join(flags) if flags else "REVIEW"
         print(f"\n[{flag_str}]  {prefix}")
-        print(f"  Beta  index : {entry.get('beta_index') or '(none)'}")
-        print(f"  Stage index : {entry.get('stage_index') or '(none)'}")
+        print(f"  Index : {entry_index_name(entry) or '(none)'}")
 
         if entry.get("error"):
-            print(f"  Error       : {entry['error']}")
+            print(f"  Error : {entry['error']}")
             continue
 
-        comparison = entry.get("comparison") or {}
-        mismatches = comparison.get("type_mismatches") or []
-        if mismatches:
-            print(f"  Type mismatches ({len(mismatches)}):")
-            for item in mismatches[:20]:
-                print(
-                    f"    - {item['field']}: "
-                    f"beta={item['beta_type']}  stage={item['stage_type']}"
-                )
-            if len(mismatches) > 20:
-                print(f"    ... and {len(mismatches) - 20} more")
-
-        if beta_enabled:
-            missing_stage = comparison.get("missing_in_stage") or []
-            missing_beta = comparison.get("missing_in_beta") or []
-            if missing_stage:
-                preview = ", ".join(missing_stage[:8])
-                more = f" (+{len(missing_stage) - 8} more)" if len(missing_stage) > 8 else ""
-                print(f"  Missing in Stage ({len(missing_stage)}): {preview}{more}")
-            if missing_beta:
-                preview = ", ".join(missing_beta[:8])
-                more = f" (+{len(missing_beta) - 8} more)" if len(missing_beta) > 8 else ""
-                print(f"  Missing in Beta  ({len(missing_beta)}): {preview}{more}")
-
-        env_checks = [("Stage", stage_ecs)]
-        if beta_enabled:
-            env_checks.insert(0, ("Beta", beta_ecs))
-        for env_label, ecs in env_checks:
-            if not ecs:
-                continue
-            ready = "yes" if ecs.get("ecs_ready") else "NO"
+        issues = entry.get("issues") or {}
+        missing_ecs = issues.get("missing_ecs_fields") or []
+        if missing_ecs:
             print(
-                f"  ECS ({env_label}): ready={ready} "
-                f"({ecs.get('ecs_fields_present')}/{ecs.get('ecs_fields_total')})"
+                f"  Missing required ECS ({len(missing_ecs)}): "
+                + ", ".join(missing_ecs)
             )
-            for field, detail in (ecs.get("fields") or {}).items():
+
+        if ecs_info:
+            ready = "yes" if ecs_info.get("ecs_ready") else "NO"
+            print(
+                f"  ECS: ready={ready} "
+                f"({ecs_info.get('ecs_fields_present')}/{ecs_info.get('ecs_fields_total')})"
+            )
+            for field, detail in (ecs_info.get("fields") or {}).items():
                 st = detail.get("status")
                 if st == "ecs":
                     continue
@@ -2107,33 +1670,20 @@ def print_cli_summary(report: Dict[str, Any]) -> None:
                 legacy_str = f" (legacy: {', '.join(legacy)})" if legacy else ""
                 print(f"    · {field}: {st}{legacy_str}")
 
-    # Clean prefixes one-liner
-    if beta_enabled:
-        clean = [
-            r["prefix"]
-            for r in report["results"]
-            if r["status"] == "ok"
-            and not r.get("has_schema_drift")
-            and (r.get("ecs") or {}).get("beta", {}).get("ecs_ready")
-            and (r.get("ecs") or {}).get("stage", {}).get("ecs_ready")
-        ]
-        clean_label = "Clean (no drift, ECS-ready on both)"
-    else:
-        clean = [
-            r["prefix"]
-            for r in report["results"]
-            if r["status"] == "ok"
-            and not r.get("has_schema_drift")
-            and (r.get("ecs") or {}).get("stage", {}).get("ecs_ready")
-        ]
-        clean_label = "Clean (Stage present, ECS-ready)"
+    clean = [
+        r["prefix"]
+        for r in report["results"]
+        if r["status"] == "ok"
+        and not r.get("has_schema_drift")
+        and normalize_ecs(r.get("ecs")).get("ecs_ready")
+    ]
     print()
     print(_hr("-"))
     if clean:
-        print(f" {clean_label}: {len(clean)}")
+        print(f" Clean (present, ECS-ready): {len(clean)}")
         print("  " + ", ".join(clean))
     else:
-        print(f" {clean_label}: 0")
+        print(" Clean (present, ECS-ready): 0")
     print(_hr())
 
 
@@ -2155,7 +1705,6 @@ def main(
     field_counts_csv: str = FIELD_COUNTS_CSV_FILE,
     mappings_yaml: str = MAPPINGS_YAML_FILE,
     mappings_yaml_dir: str = MAPPINGS_YAML_DIR,
-    enable_beta: Optional[bool] = None,
     index_date: Optional[str] = None,
 ) -> int:
     """
@@ -2171,8 +1720,6 @@ def main(
     )
     logging.getLogger("elasticsearch").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-    beta_enabled = ENABLE_BETA if enable_beta is None else enable_beta
 
     raw_index_date = (index_date or os.environ.get("INDEX_DATE", "")).strip()
     as_of: Optional[date] = parse_index_date(raw_index_date) if raw_index_date else None
@@ -2199,7 +1746,7 @@ def main(
         )
     if not prefixes:
         logger.error(
-            "No prefixes left after PREFIX_FILTER=%r — nothing to compare",
+            "No prefixes left after PREFIX_FILTER=%r — nothing to analyze",
             os.getenv("PREFIX_FILTER", ""),
         )
         return 1
@@ -2223,50 +1770,33 @@ def main(
     config = config or {}
     shared_verify = config.get("verify_certs")
 
-    beta_cfg = dict(config.get("beta") or {})
-    stage_cfg = dict(config.get("stage") or {})
+    es_cfg = dict(config.get("elasticsearch") or config.get("es") or config.get("stage") or {})
     if shared_verify is not None:
-        beta_cfg.setdefault("verify_certs", shared_verify)
-        stage_cfg.setdefault("verify_certs", shared_verify)
+        es_cfg.setdefault("verify_certs", shared_verify)
 
-    beta: Optional[Elasticsearch] = None
-    if beta_enabled:
-        beta = build_es_client(
-            "BETA_ES_URL", "BETA_ES_USER", "BETA_ES_PASSWORD", "Beta", beta_cfg
-        )
-    else:
-        logger.info(
-            "ENABLE_BETA=false — skipping Beta client build/ping (Stage-only mode)"
-        )
-
-    stage = build_es_client(
-        "STAGE_ES_URL", "STAGE_ES_USER", "STAGE_ES_PASSWORD", "Stage", stage_cfg
+    es = build_es_client(
+        "ES_URL", "ES_USER", "ES_PASSWORD", "Elasticsearch", es_cfg
     )
 
-    clients_to_ping: List[Tuple[str, Elasticsearch]] = [("Stage", stage)]
-    if beta_enabled and beta is not None:
-        clients_to_ping.insert(0, ("Beta", beta))
-
-    for label, client in clients_to_ping:
-        try:
-            if not client.ping():
-                print(
-                    f"WARNING: {label} cluster did not respond to ping()",
-                    file=sys.stderr,
-                )
-        except Exception as exc:  # noqa: BLE001
+    try:
+        if not es.ping():
             print(
-                f"WARNING: {label} ping failed: {_explain_transport_error(exc)}",
+                "WARNING: Elasticsearch cluster did not respond to ping()",
                 file=sys.stderr,
             )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"WARNING: Elasticsearch ping failed: {_explain_transport_error(exc)}",
+            file=sys.stderr,
+        )
 
-    # Pinned day: require Stage daily indices BEFORE creating results/<day>/.
+    # Pinned day: require daily indices BEFORE creating results/<day>/.
     if as_of is not None:
-        stage_hits = count_stage_indices_for_day(stage, prefixes, as_of)
-        if stage_hits == 0:
+        hits = count_indices_for_day(es, prefixes, as_of)
+        if hits == 0:
             suffix = index_date_suffix(as_of)
             msg = (
-                f"No Stage indices for INDEX_DATE={day_label} "
+                f"No Elasticsearch indices for INDEX_DATE={day_label} "
                 f"(looked for *-logs-{suffix} / *-{suffix}). "
                 "Results folder was NOT created."
             )
@@ -2274,14 +1804,13 @@ def main(
             print(f"ERROR: {msg}", file=sys.stderr)
             stale = results_root / day_label
             if stale.is_dir():
-                # Do not keep a day folder when Stage has no daily indices.
                 shutil.rmtree(stale, ignore_errors=True)
                 print(f"Removed empty/invalid results folder: {stale}", file=sys.stderr)
             return 1
         logger.info(
-            "INDEX_DATE=%s — found %d Stage index(es) for %s",
+            "INDEX_DATE=%s — found %d index(es) for %s",
             day_label,
-            stage_hits,
+            hits,
             index_date_suffix(as_of),
         )
 
@@ -2314,13 +1843,7 @@ def main(
             RESULTS_DIR,
         )
 
-    report = compare_clusters(
-        beta,
-        stage,
-        prefixes=prefixes,
-        enable_beta=beta_enabled,
-        as_of=as_of,
-    )
+    report = analyze_cluster(es, prefixes=prefixes, as_of=as_of)
     json_path = save_report(report, path=output)
     mappings_path = export_mappings_to_csv(report, csv_path=mappings_csv)
     readiness_path = export_central_format_readiness_csv(
@@ -2345,18 +1868,16 @@ def main(
     print(f"  YAML : {yaml_dir}/<prefix>.yaml")
     print(_hr())
 
-    if report["prefixes_with_type_mismatches"] or report["prefixes_with_schema_drift"]:
+    if report["prefixes_with_schema_drift"]:
         return 2
     return 0
-
 
 
 if __name__ == "__main__":
     # Optional inline config dictionary (overrides / supplements env vars).
     # Leave empty to rely solely on environment variables.
     CONFIG: Dict[str, Any] = {
-        # "beta": {"url": "https://beta-es:9200", "user": "elastic", "password": "..."},
-        # "stage": {"url": "https://stage-es:9200", "user": "elastic", "password": "..."},
+        # "elasticsearch": {"url": "https://es:9200", "user": "elastic", "password": "..."},
         # "verify_certs": False,
     }
     sys.exit(main(config=CONFIG))

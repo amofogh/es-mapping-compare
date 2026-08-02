@@ -1,17 +1,17 @@
 # EFK Schema Migration
 
-Inventory Elasticsearch mappings (Stage ± Beta), score ECS readiness, and plan Fluentd central log formats.
+Inventory Elasticsearch mappings, score ECS readiness, and plan Fluentd central log formats.
 
 ## Quick start
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # set STAGE_ES_* (and optional BETA_ES_*)
+cp .env.example .env   # set ES_URL / ES_USER / ES_PASSWORD
 
 python discover_prefixes.py
 # pin a calendar day of daily indices (YYYY-MM-DD):
-INDEX_DATE=2026-07-28 ENABLE_BETA=false python compare_es_mappings.py
+INDEX_DATE=2026-07-28 python compare_es_mappings.py
 
 docker compose --profile panel up -d --build panel   # http://localhost:8501
 ```
@@ -26,7 +26,6 @@ HOST_UID=$(id -u) HOST_GID=$(id -g) \
 
 # helpers
 PREFIX_FILTER=mic docker compose run --rm es-mapping-compare
-ENABLE_BETA=true docker compose up --abort-on-container-exit --exit-code-from es-mapping-compare
 docker compose run --rm --entrypoint /docker-entrypoint.sh es-mapping-compare fix-perms
 ```
 
@@ -37,10 +36,10 @@ Pinned day → `results/<YYYY-MM-DD>/` (e.g. `INDEX_DATE=2026-07-28`).
 
 | File | What |
 |------|------|
-| `mapping_comparison.json` | Full report |
+| `mapping_comparison.json` | Full cluster analysis report |
 | `central_format_readiness.csv` | Per-service format + ECS |
 | `all_index_mappings.csv` | One row per field |
-| `index_field_counts.csv` | Docs / size / beta status |
+| `index_field_counts.csv` | Docs / size / field counts |
 | `all_index_mappings.yaml` | All services |
 | `index_mappings/<prefix>.yaml` | Per service |
 
@@ -54,9 +53,7 @@ Optional: `RESULTS_RUN=label`, `RESULTS_DIR=/path`.
 
 **ECS score:** `N/5` for `@timestamp`, `log.level`, `message`, `service.name`, `host.name`. Legacy names (`level`, `service`, …) do **not** count until remapped. Ready = `5/5`.
 
-**`ENABLE_BETA=false`:** Stage-only (default). **`true`:** compare Stage↔Beta.
-
-**Exit `2`:** schema drift / type mismatches (results still written).
+**Exit `2`:** schema / ECS gaps found (results still written).
 
 ## Layout
 

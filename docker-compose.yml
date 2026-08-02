@@ -10,9 +10,7 @@ x-app: &app
   env_file:
     - .env
   environment:
-    ENABLE_BETA: ${ENABLE_BETA:-false}
     ES_VERIFY_CERTS: ${ES_VERIFY_CERTS:-false}
-    DISCOVER_CLUSTER: ${DISCOVER_CLUSTER:-stage}
     # Optional: mic | mic,cd | mic-api,mic-ava  (empty = all)
     PREFIX_FILTER: ${PREFIX_FILTER:-}
     # Optional: pin index calendar day YYYY-MM-DD (panel / CLI)
@@ -28,7 +26,7 @@ x-app: &app
   entrypoint: ["/docker-entrypoint.sh"]
 
 services:
-  # Step 1: scan ES and merge service prefixes into prefixes.json
+  # Step 1: scan Elasticsearch and merge service prefixes into prefixes.json
   discover-prefixes:
     <<: *app
     container_name: es-discover-prefixes
@@ -43,7 +41,7 @@ services:
       discover-prefixes:
         condition: service_completed_successfully
 
-  # Streamlit dashboard — pick an index day and fetch from ES
+  # Streamlit dashboard — pick an index day and fetch from Elasticsearch
   panel:
     <<: *app
     container_name: efk-schema-panel
@@ -55,7 +53,6 @@ services:
       STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
       STREAMLIT_BROWSER_GATHERUSAGESTATS: "false"
       STREAMLIT_SERVER_HEADLESS: "true"
-      ENABLE_BETA: ${ENABLE_BETA:-false}
       ES_VERIFY_CERTS: ${ES_VERIFY_CERTS:-false}
       PREFIX_FILTER: ${PREFIX_FILTER:-}
     volumes:

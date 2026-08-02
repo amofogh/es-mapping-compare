@@ -13,6 +13,14 @@ import pandas as pd
 import streamlit as st
 import yaml
 
+from compare_es_mappings import (
+    build_es_client,
+    entry_fields,
+    entry_index_name,
+    entry_index_size,
+    normalize_ecs,
+)
+
 RESULTS_ROOT = Path(__file__).resolve().parent / "results"
 REQUIRED_FILES = (
     "central_format_readiness.csv",
@@ -21,8 +29,20 @@ REQUIRED_FILES = (
 )
 DAY_FOLDER_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:_\d{6})?$")
 
+# Legacy CSV column names → current schema
+_LEGACY_CSV_COLUMNS = {
+    "stage_index": "index_name",
+    "stage_fields": "field_count",
+    "stage_docs": "docs_count",
+    "stage_index_size": "index_size",
+    "stage_avg_log_size": "avg_log_size",
+    "total_fields_stage": "total_fields",
+    "stage_resolved_index": "resolved_index",
+    "stage_data_type": "data_type",
+}
+
 st.set_page_config(
-    page_title="EFK Schema Migration",
+    page_title="EFK Migration & Schema Analyzer",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -165,16 +185,15 @@ def _infer_day_from_report(run_dir: Path) -> str | None:
     if meta.get("index_date"):
         return str(meta["index_date"])[:10].replace(".", "-")
     for entry in meta.get("results") or []:
-        for key in ("stage_index", "beta_index"):
-            name = str(entry.get(key) or "")
-            m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})", name)
-            if m:
-                return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        name = str(entry_index_name(entry) or "")
+        m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})", name)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     return None
 
 
-def _folder_has_stage_for_day(run_dir: Path, day: str) -> bool:
-    """True if the report resolved at least one Stage index for ``day``."""
+def _folder_has_indices_for_day(run_dir: Path, day: str) -> bool:
+    """True if the report resolved at least one index for ``day``."""
     meta_path = run_dir / "mapping_comparison.json"
     if not meta_path.is_file():
         return False
@@ -185,10 +204,20 @@ def _folder_has_stage_for_day(run_dir: Path, day: str) -> bool:
         return False
     suffix = day.replace("-", ".")
     for entry in meta.get("results") or []:
-        idx = entry.get("stage_index")
+        idx = entry_index_name(entry)
         if idx and suffix in str(idx):
             return True
     return False
+
+
+def _normalize_csv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename legacy stage_* CSV columns to current names when present."""
+    rename = {
+        old: new for old, new in _LEGACY_CSV_COLUMNS.items() if old in df.columns
+    }
+    if rename:
+        df = df.rename(columns=rename)
+    return df
 
 
 @st.cache_data(show_spinner=False)
@@ -211,10 +240,8 @@ def discover_days(results_root: str) -> dict[str, str]:
         day = _day_from_folder(child.name) or _infer_day_from_report(child)
         if not day:
             continue
-        # Skip caches with zero Stage daily indexes for that day.
-        if not _folder_has_stage_for_day(child, day):
+        if not _folder_has_indices_for_day(child, day):
             continue
-        # Prefer plain YYYY-MM-DD (rank 0) over YYYY-MM-DD_HHMMSS (rank 1)
         rank = 0 if child.name == day else 1
         try:
             mtime = (child / "mapping_comparison.json").stat().st_mtime
@@ -250,18 +277,15 @@ def _boolify(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def list_es_index_days() -> list[str]:
-    """Ask Stage ES which daily index dates exist (for the date picker)."""
+    """Ask Elasticsearch which daily index dates exist (for the date picker)."""
     try:
         from compare_es_mappings import (  # local import keeps Streamlit startup light
-            build_es_client,
             list_available_index_dates,
             load_service_prefixes,
         )
 
-        stage = build_es_client(
-            "STAGE_ES_URL", "STAGE_ES_USER", "STAGE_ES_PASSWORD", "Stage"
-        )
-        days = list_available_index_dates(stage, load_service_prefixes())
+        es = build_es_client()
+        days = list_available_index_dates(es, load_service_prefixes())
         return [d.isoformat() for d in days]
     except Exception:  # noqa: BLE001
         return []
@@ -269,16 +293,14 @@ def list_es_index_days() -> list[str]:
 
 def fetch_index_day(
     day: str,
-    enable_beta: bool | None = None,
     prefix_filter: str = "",
 ) -> tuple[int, str]:
-    """Run compare for a pinned index day; returns (exit_code, log_tail)."""
+    """Run index analysis for a pinned index day; returns (exit_code, log_tail)."""
     import contextlib
     import io
 
     from compare_es_mappings import main as compare_main
 
-    # PREFIX_FILTER is read inside filter_prefixes() / main().
     prev = os.environ.get("PREFIX_FILTER")
     if prefix_filter:
         os.environ["PREFIX_FILTER"] = prefix_filter
@@ -288,7 +310,7 @@ def fetch_index_day(
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            code = compare_main(index_date=day, enable_beta=enable_beta)
+            code = compare_main(index_date=day)
     finally:
         if prev is None:
             os.environ.pop("PREFIX_FILTER", None)
@@ -373,9 +395,14 @@ def apply_project_filter(
     filtered_comparison["prefixes_with_schema_drift"] = sum(
         1 for r in filtered_results if r.get("has_schema_drift")
     )
-    filtered_comparison["prefixes_with_type_mismatches"] = sum(
-        1 for r in filtered_results if r.get("has_type_mismatch")
+    filtered_comparison["prefixes_not_ecs_ready"] = sum(
+        1
+        for r in filtered_results
+        if entry_index_name(r) and not normalize_ecs(r.get("ecs")).get("ecs_ready", False)
     )
+    filtered_comparison["prefixes_with_ecs_gaps"] = filtered_comparison[
+        "prefixes_not_ecs_ready"
+    ]
     return ready, maps, filtered_comparison, counts
 
 
@@ -401,17 +428,18 @@ def load_data(
             + f". Expected under `{run_dir}`."
         )
 
-    readiness = _boolify(pd.read_csv(readiness_csv), ("can_centralize_as_is",))
-    mappings = _boolify(
-        pd.read_csv(mappings_csv),
-        ("is_type_mismatch", "exists_in_both_envs", "is_ecs_standard"),
+    readiness = _normalize_csv_columns(
+        _boolify(pd.read_csv(readiness_csv), ("can_centralize_as_is",))
+    )
+    mappings = _normalize_csv_columns(
+        _boolify(pd.read_csv(mappings_csv), ("is_ecs_standard",))
     )
     with comparison_json.open(encoding="utf-8") as fh:
         comparison = json.load(fh)
 
     field_counts = None
     if field_counts_csv.is_file():
-        field_counts = pd.read_csv(field_counts_csv)
+        field_counts = _normalize_csv_columns(pd.read_csv(field_counts_csv))
 
     return readiness, mappings, comparison, field_counts
 
@@ -459,7 +487,8 @@ def _ecs_checklist_df(ecs_side: dict[str, Any] | None) -> pd.DataFrame:
             {
                 "ecs_field": name,
                 "present": bool(detail.get("present")),
-                "status": detail.get("status") or ("ecs" if detail.get("present") else "missing"),
+                "status": detail.get("status")
+                or ("ecs" if detail.get("present") else "missing"),
                 "mapped_type": detail.get("type") or "—",
                 "legacy_alternatives": ", ".join(legacy) if legacy else "",
             }
@@ -470,78 +499,87 @@ def _ecs_checklist_df(ecs_side: dict[str, Any] | None) -> pd.DataFrame:
 def _project_status_table(comparison: dict[str, Any]) -> pd.DataFrame:
     rows = []
     for entry in comparison.get("results") or []:
-        stage_ecs = ((entry.get("ecs") or {}).get("stage") or {})
-        beta_ecs = ((entry.get("ecs") or {}).get("beta") or {})
-        cmp = entry.get("comparison") or {}
+        ecs_info = normalize_ecs(entry.get("ecs"))
+        issues = entry.get("issues") or {}
         rows.append(
             {
                 "project_prefix": entry.get("prefix"),
                 "status": entry.get("status"),
                 "error": entry.get("error") or "",
-                "beta_prefix": entry.get("beta_prefix") or "",
-                "stage_index": entry.get("stage_index") or "",
-                "beta_index": entry.get("beta_index") or "",
+                "index_name": entry_index_name(entry) or "",
                 "has_schema_drift": bool(entry.get("has_schema_drift")),
-                "has_type_mismatch": bool(entry.get("has_type_mismatch")),
-                "stage_ecs_ready": bool(stage_ecs.get("ecs_ready")),
-                "stage_ecs_score": (
-                    f"{stage_ecs.get('ecs_fields_present', 0)}/"
-                    f"{stage_ecs.get('ecs_fields_total', 5)}"
-                    if stage_ecs
+                "has_ecs_gaps": bool(
+                    entry.get("has_ecs_gaps")
+                    or issues.get("missing_ecs_fields")
+                    or not ecs_info.get("ecs_ready", False)
+                ),
+                "ecs_ready": bool(ecs_info.get("ecs_ready")),
+                "ecs_score": (
+                    f"{ecs_info.get('ecs_fields_present', 0)}/"
+                    f"{ecs_info.get('ecs_fields_total', 5)}"
+                    if ecs_info
                     else "—"
                 ),
-                "beta_ecs_ready": bool(beta_ecs.get("ecs_ready")) if beta_ecs else False,
-                "beta_ecs_score": (
-                    f"{beta_ecs.get('ecs_fields_present', 0)}/"
-                    f"{beta_ecs.get('ecs_fields_total', 5)}"
-                    if beta_ecs
-                    else "—"
-                ),
-                "missing_in_stage": len(cmp.get("missing_in_stage") or []),
-                "missing_in_beta": len(cmp.get("missing_in_beta") or []),
-                "type_mismatches": len(cmp.get("type_mismatches") or []),
-                "stage_size": _size_label(entry.get("stage_size")),
-                "beta_size": _size_label(entry.get("beta_size")),
+                "missing_ecs_fields": len(issues.get("missing_ecs_fields") or []),
+                "index_size": _size_label(entry_index_size(entry)),
             }
         )
     return pd.DataFrame(rows)
 
 
 def _kpi(readiness: pd.DataFrame, comparison: dict[str, Any]) -> dict[str, int]:
+    missing_ecs_col = (
+        readiness["missing_ecs_fields_count"]
+        if "missing_ecs_fields_count" in readiness.columns
+        else None
+    )
     return {
         "total_projects": int(
             comparison.get("prefixes_total") or len(readiness)
         ),
-        "ecs_ready": int((readiness["ecs_compliant_fields_count"] >= 5).sum()),
+        "ecs_ready": int((readiness["ecs_compliant_fields_count"] >= 5).sum())
+        if "ecs_compliant_fields_count" in readiness.columns
+        else int(comparison.get("prefixes_total", 0))
+        - int(comparison.get("prefixes_not_ecs_ready") or 0),
         "not_ecs_ready": int(
             comparison.get("prefixes_not_ecs_ready")
-            or (readiness["ecs_compliant_fields_count"] < 5).sum()
+            or (
+                (readiness["ecs_compliant_fields_count"] < 5).sum()
+                if "ecs_compliant_fields_count" in readiness.columns
+                else 0
+            )
         ),
         "legacy_workers": int(
             readiness["target_log_format"]
             .astype(str)
             .str.contains("Format 3", na=False)
             .sum()
-        ),
+        )
+        if "target_log_format" in readiness.columns
+        else 0,
         "schema_drift": int(comparison.get("prefixes_with_schema_drift") or 0),
-        "type_conflict_projects": int(
-            comparison.get("prefixes_with_type_mismatches") or 0
+        "ecs_gap_projects": int(
+            comparison.get("prefixes_with_ecs_gaps")
+            or comparison.get("prefixes_not_ecs_ready")
+            or (
+                (missing_ecs_col > 0).sum()
+                if missing_ecs_col is not None
+                else 0
+            )
         ),
-        "type_conflicts": int(readiness["type_mismatches_count"].fillna(0).sum()),
+        "missing_ecs_fields": int(
+            missing_ecs_col.fillna(0).sum() if missing_ecs_col is not None else 0
+        ),
     }
 
 
 def _diff_readiness(baseline: pd.DataFrame, current: pd.DataFrame) -> pd.DataFrame:
     keys = ["project_prefix"]
     cols = [
-        "total_fields_stage",
-        "total_fields_beta",
-        "ecs_compliant_fields_count",
-        "type_mismatches_count",
-        "target_log_format",
-        "can_centralize_as_is",
-        "stage_docs",
-        "beta_docs",
+        "total_fields",
+        "docs_count",
+        "index_size",
+        "avg_log_size",
     ]
     left = baseline[keys + [c for c in cols if c in baseline.columns]].copy()
     right = current[keys + [c for c in cols if c in current.columns]].copy()
@@ -549,12 +587,18 @@ def _diff_readiness(baseline: pd.DataFrame, current: pd.DataFrame) -> pd.DataFra
     right = right.rename(columns={c: f"{c}_new" for c in cols if c in right.columns})
     merged = left.merge(right, on="project_prefix", how="outer", indicator=True)
 
-    def _delta(old_col: str, new_col: str) -> pd.Series:
-        if old_col not in merged.columns or new_col not in merged.columns:
+    def _num(col: str) -> pd.Series:
+        if col not in merged.columns:
             return pd.Series([pd.NA] * len(merged))
-        return pd.to_numeric(merged[new_col], errors="coerce") - pd.to_numeric(
-            merged[old_col], errors="coerce"
-        )
+        return pd.to_numeric(merged[col], errors="coerce")
+
+    def _text(col: str) -> pd.Series:
+        if col not in merged.columns:
+            return pd.Series([""] * len(merged))
+        return merged[col].astype(str).replace({"nan": "", "None": "", "<NA>": ""})
+
+    def _delta(old_col: str, new_col: str) -> pd.Series:
+        return _num(new_col) - _num(old_col)
 
     change = (
         merged["_merge"]
@@ -573,31 +617,25 @@ def _diff_readiness(baseline: pd.DataFrame, current: pd.DataFrame) -> pd.DataFra
         {
             "project_prefix": merged["project_prefix"],
             "change": change.values,
-            "stage_fields_Δ": _delta("total_fields_stage_old", "total_fields_stage_new"),
-            "beta_fields_Δ": _delta("total_fields_beta_old", "total_fields_beta_new"),
-            "ecs_fields_Δ": _delta(
-                "ecs_compliant_fields_count_old", "ecs_compliant_fields_count_new"
-            ),
-            "type_mismatches_Δ": _delta(
-                "type_mismatches_count_old", "type_mismatches_count_new"
-            ),
-            "stage_docs_Δ": _delta("stage_docs_old", "stage_docs_new"),
-            "beta_docs_Δ": _delta("beta_docs_old", "beta_docs_new"),
-            "format_old": merged.get("target_log_format_old"),
-            "format_new": merged.get("target_log_format_new"),
+            "fields_baseline": _num("total_fields_old"),
+            "fields_current": _num("total_fields_new"),
+            "fields_Δ": _delta("total_fields_old", "total_fields_new"),
+            "docs_baseline": _num("docs_count_old"),
+            "docs_current": _num("docs_count_new"),
+            "docs_Δ": _delta("docs_count_old", "docs_count_new"),
+            "size_baseline": _text("index_size_old"),
+            "size_current": _text("index_size_new"),
+            "avg_doc_baseline": _text("avg_log_size_old"),
+            "avg_doc_current": _text("avg_log_size_new"),
         }
     )
 
     both = out["change"] == "changed"
     unchanged = both & (
-        out["stage_fields_Δ"].fillna(0).eq(0)
-        & out["beta_fields_Δ"].fillna(0).eq(0)
-        & out["ecs_fields_Δ"].fillna(0).eq(0)
-        & out["type_mismatches_Δ"].fillna(0).eq(0)
-        & (
-            out["format_old"].astype(str).fillna("")
-            == out["format_new"].astype(str).fillna("")
-        )
+        out["fields_Δ"].fillna(0).eq(0)
+        & out["docs_Δ"].fillna(0).eq(0)
+        & (out["size_baseline"].fillna("") == out["size_current"].fillna(""))
+        & (out["avg_doc_baseline"].fillna("") == out["avg_doc_current"].fillna(""))
     )
     out.loc[unchanged, "change"] = "unchanged"
     change_order = {"added": 0, "removed": 1, "changed": 2, "unchanged": 3}
@@ -612,7 +650,7 @@ def _render_list_table(title: str, items: list[Any], empty: str) -> None:
         return
     st.dataframe(
         pd.DataFrame({"field": items}),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(280, 38 + 35 * min(len(items), 8)),
     )
@@ -621,7 +659,7 @@ def _render_list_table(title: str, items: list[Any], empty: str) -> None:
 # ---------------------------------------------------------------------------
 # Bootstrap — pick an index day, fetch from ES if needed
 # ---------------------------------------------------------------------------
-cached_days = discover_days(str(RESULTS_ROOT))  # day -> folder
+cached_days = discover_days(str(RESULTS_ROOT))
 es_days = list_es_index_days()
 all_day_options = sorted(set(cached_days) | set(es_days), reverse=True)
 
@@ -635,13 +673,12 @@ st.title("🔎 EFK Migration & Schema Analyzer")
 
 team_options = ["All"] + load_team_options()
 
-# Row 1 — Date inputs & comparison setup
 col1, col2, col3 = st.columns([1, 1, 1], gap="medium")
 with col1:
     selected_day_date = st.date_input(
         "Index day",
         value=default_day,
-        help="Resolves Stage/Beta indices for this calendar day "
+        help="Resolves daily indices for this calendar day "
         "(e.g. mic-ava-logs-2026.07.28).",
     )
     selected_day = selected_day_date.isoformat()
@@ -661,30 +698,17 @@ with col3:
         "Pick a team (e.g. mic, ams) to limit view and Fetch.",
     )
 
-# Row 2 — Actions & toggles (pad toggle so it centers vs primary button)
-col_toggle, col_btn = st.columns([1, 3], gap="medium")
-with col_toggle:
-    st.markdown(
-        "<div style='padding-top: 1.8rem;'></div>",
-        unsafe_allow_html=True,
-    )
-    enable_beta_ui = st.toggle(
-        "Include Beta",
-        value=os.environ.get("ENABLE_BETA", "false").lower() in ("1", "true", "yes"),
-    )
-with col_btn:
-    fetch_clicked = st.button(
-        "⬇ Fetch from Elasticsearch",
-        type="primary",
-        use_container_width=True,
-        help="Query ES for this day's indices. Uses Projects filter "
-        "(All or a single team like mic).",
-    )
+fetch_clicked = st.button(
+    "⬇ Fetch from Elasticsearch",
+    type="primary",
+    width="stretch",
+    help="Query Elasticsearch for this day's indices. Uses Projects filter "
+    "(All or a single team like mic).",
+)
 
-# Status — available Stage days
 if es_days:
     st.caption(
-        "Days found on Stage ES: "
+        "Days found on Elasticsearch: "
         + ", ".join(f"`{d}`" for d in es_days[:14])
         + (" …" if len(es_days) > 14 else "")
     )
@@ -696,19 +720,17 @@ else:
 
 if fetch_clicked:
     with st.spinner(f"Fetching mappings for index day {selected_day}…"):
-        # Bust caches after write
         discover_days.clear()
         load_data.clear()
         list_es_index_days.clear()
         code, log_tail = fetch_index_day(
             selected_day,
-            enable_beta=enable_beta_ui,
             prefix_filter="" if project_filter == "All" else project_filter,
         )
     if code in (0, 2):
         st.success(
             f"Loaded index day `{selected_day}` "
-            f"(exit {code}; 2 means drift/mismatches found)."
+            f"(exit {code}; 2 means schema/ECS issues found)."
         )
         if log_tail.strip():
             with st.expander("Fetch log", expanded=False):
@@ -718,7 +740,7 @@ if fetch_clicked:
     else:
         st.error(
             f"Fetch aborted for `{selected_day}` (exit {code}). "
-            "No results folder was created because Stage has no daily indices "
+            "No results folder was created because Elasticsearch has no daily indices "
             "for that day."
         )
         st.code(log_tail or "(no output)")
@@ -746,7 +768,6 @@ except Exception as exc:  # noqa: BLE001
     st.error(f"⚠️ Failed to load migration data: {exc}")
     st.stop()
 
-# Apply team filter to everything shown in the panel.
 readiness_df, mappings_df, comparison_data, field_counts_df = apply_project_filter(
     readiness_df,
     mappings_df,
@@ -767,23 +788,15 @@ kpis = _kpi(readiness_df, comparison_data)
 status_df = _project_status_table(comparison_data)
 
 day_suffix = selected_day.replace("-", ".")
-stage_hits = 0
-beta_hits = 0
-stage_wrong_day = 0
-beta_wrong_day = 0
+index_hits = 0
+wrong_day_count = 0
 for entry in comparison_data.get("results") or []:
-    stage_idx = entry.get("stage_index")
-    beta_idx = entry.get("beta_index")
-    if stage_idx and stage_idx not in ("DISABLED", "MISSING"):
-        if day_suffix in str(stage_idx):
-            stage_hits += 1
+    idx = entry_index_name(entry)
+    if idx and idx not in ("DISABLED", "MISSING"):
+        if day_suffix in str(idx):
+            index_hits += 1
         else:
-            stage_wrong_day += 1
-    if beta_idx and beta_idx not in ("DISABLED", "MISSING", None):
-        if day_suffix in str(beta_idx):
-            beta_hits += 1
-        else:
-            beta_wrong_day += 1
+            wrong_day_count += 1
 
 st.markdown(
     f'<div class="efk-status-bar">'
@@ -791,19 +804,17 @@ st.markdown(
     f"Folder: <code>{selected_run}</code> · "
     f"Filter: <code>{project_filter}</code> · "
     f"Generated: <code>{comparison_data.get('generated_at', '—')}</code> · "
-    f"Mode: <code>{comparison_data.get('mode', '—')}</code> · "
-    f"Beta: <code>{comparison_data.get('enable_beta', False)}</code> · "
-    f"Stage indexes: <strong>{stage_hits}</strong> · "
-    f"Beta indexes: <strong>{beta_hits}</strong>"
+    f"Mode: <code>{comparison_data.get('mode', 'cluster')}</code> · "
+    f"Indexes: <strong>{index_hits}</strong>"
     f"</div>",
     unsafe_allow_html=True,
 )
 
-if stage_hits == 0:
+if index_hits == 0:
     st.error(
-        f"No Stage daily indices for **{selected_day}** "
+        f"No daily indices for **{selected_day}** "
         f"(`*-{day_suffix}` / `*-logs-{day_suffix}`). "
-        "This cached folder is invalid for Stage analysis."
+        "This cached folder is invalid for index analysis."
     )
     if st.button(f"🗑 Delete invalid cache `{selected_run}`"):
         import shutil
@@ -813,10 +824,10 @@ if stage_hits == 0:
         load_data.clear()
         st.rerun()
     st.stop()
-elif stage_wrong_day or beta_wrong_day:
+elif wrong_day_count:
     st.warning(
         f"Some resolved indexes do not contain `{day_suffix}` "
-        f"(Stage wrong-day: {stage_wrong_day}, Beta wrong-day: {beta_wrong_day})."
+        f"(wrong-day: {wrong_day_count})."
     )
 
 (
@@ -851,18 +862,18 @@ with tab_readiness:
     with kpi_cols[3]:
         st.metric("Legacy Workers (F3)", kpis["legacy_workers"])
     with kpi_cols[4]:
-        st.metric("Schema Drift Projects", kpis["schema_drift"])
+        st.metric("Schema Issues", kpis["schema_drift"])
     with kpi_cols[5]:
         st.metric(
-            "Type Conflict Projects",
-            kpis["type_conflict_projects"],
-            help=f"{kpis['type_conflicts']} mismatched field rows total",
+            "ECS Gap Projects",
+            kpis["ecs_gap_projects"],
+            help=f"{kpis['missing_ecs_fields']} missing required ECS fields total",
         )
 
     st.markdown("##### Central format readiness")
     st.dataframe(
         readiness_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "project_prefix": st.column_config.TextColumn(
@@ -881,41 +892,29 @@ with tab_readiness:
             "can_centralize_as_is": st.column_config.CheckboxColumn(
                 "Can Centralize As-Is", width="small"
             ),
-            "type_mismatches_count": st.column_config.NumberColumn(
-                "Type Mismatches", format="%d"
+            "missing_ecs_fields_count": st.column_config.NumberColumn(
+                "Missing ECS", format="%d"
             ),
-            "total_fields_stage": st.column_config.NumberColumn(
-                "Stage Fields", format="%d"
-            ),
-            "total_fields_beta": st.column_config.NumberColumn(
-                "Beta Fields", format="%d"
-            ),
-            "common_fields_count": st.column_config.NumberColumn(
-                "Common Fields", format="%d"
-            ),
-            "stage_docs": st.column_config.NumberColumn("Stage Docs", format="%d"),
-            "beta_docs": st.column_config.NumberColumn("Beta Docs", format="%d"),
-            "stage_index_size": st.column_config.TextColumn("Stage Size"),
-            "beta_index_size": st.column_config.TextColumn("Beta Size"),
-            "stage_avg_log_size": st.column_config.TextColumn("Stage Avg Log"),
-            "beta_avg_log_size": st.column_config.TextColumn("Beta Avg Log"),
+            "total_fields": st.column_config.NumberColumn("Fields", format="%d"),
+            "docs_count": st.column_config.NumberColumn("Docs", format="%d"),
+            "index_size": st.column_config.TextColumn("Size"),
+            "avg_log_size": st.column_config.TextColumn("Avg Log"),
         },
     )
 
-    st.markdown("##### Project status (from comparison report)")
+    st.markdown("##### Project status (from analysis report)")
     st.caption(
-        "Includes resolve errors, Beta prefix aliases, ECS scores, schema drift, "
-        "and Stage↔Beta missing-field / type-mismatch counts."
+        "Includes resolve errors, ECS scores, schema issues, "
+        "and missing required ECS field counts."
     )
     st.dataframe(
         status_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
-            "has_schema_drift": st.column_config.CheckboxColumn("Schema Drift"),
-            "has_type_mismatch": st.column_config.CheckboxColumn("Type Mismatch"),
-            "stage_ecs_ready": st.column_config.CheckboxColumn("Stage ECS Ready"),
-            "beta_ecs_ready": st.column_config.CheckboxColumn("Beta ECS Ready"),
+            "has_schema_drift": st.column_config.CheckboxColumn("Schema Issues"),
+            "has_ecs_gaps": st.column_config.CheckboxColumn("ECS Gaps"),
+            "ecs_ready": st.column_config.CheckboxColumn("ECS Ready"),
             "error": st.column_config.TextColumn("Error", width="large"),
         },
     )
@@ -930,43 +929,42 @@ with tab_inventory:
             "Re-run `compare_es_mappings.py` to generate it."
         )
     else:
-        st.markdown("##### Stage / Beta index inventory")
+        st.markdown("##### Index inventory")
         st.caption(
-            "Resolved daily indexes, field counts, docs, store size, avg log size, "
-            "Beta prefix alias, and Beta resolve status."
+            "Resolved daily indexes, field counts, docs, store size, and avg log size."
         )
         st.dataframe(
             field_counts_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "service": st.column_config.TextColumn("Service", width="medium"),
                 "team": st.column_config.TextColumn("Team", width="small"),
                 "log_format": st.column_config.TextColumn("Log Format", width="large"),
-                "stage_index": st.column_config.TextColumn("Stage Index", width="medium"),
-                "beta_index": st.column_config.TextColumn("Beta Index", width="medium"),
-                "beta_prefix": st.column_config.TextColumn("Beta Prefix"),
-                "beta_status": st.column_config.TextColumn("Beta Status"),
-                "stage_fields": st.column_config.NumberColumn("Stage Fields", format="%d"),
-                "beta_fields": st.column_config.NumberColumn("Beta Fields", format="%d"),
-                "stage_docs": st.column_config.NumberColumn("Stage Docs", format="%d"),
-                "beta_docs": st.column_config.NumberColumn("Beta Docs", format="%d"),
+                "index_name": st.column_config.TextColumn("Index", width="medium"),
+                "field_count": st.column_config.NumberColumn("Fields", format="%d"),
+                "docs_count": st.column_config.NumberColumn("Docs", format="%d"),
             },
         )
 
-        if "beta_status" in field_counts_df.columns:
-            missing_beta = field_counts_df[
-                field_counts_df["beta_status"].astype(str).str.lower().eq("missing")
+        missing_index = field_counts_df[
+            field_counts_df["index_name"].astype(str).str.strip().eq("")
+            | field_counts_df["index_name"].isna()
+        ]
+        st.markdown(
+            f"**Index missing:** {len(missing_index)} / {len(field_counts_df)} services"
+        )
+        if not missing_index.empty:
+            cols = [
+                c
+                for c in ("service", "team", "log_format", "field_count", "docs_count")
+                if c in missing_index.columns
             ]
-            st.markdown(
-                f"**Beta missing:** {len(missing_beta)} / {len(field_counts_df)} services"
+            st.dataframe(
+                missing_index[cols],
+                width="stretch",
+                hide_index=True,
             )
-            if not missing_beta.empty:
-                st.dataframe(
-                    missing_beta[["service", "stage_index", "stage_fields", "stage_docs"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
 # ---------------------------------------------------------------------------
 # Tab — Schema
@@ -987,131 +985,91 @@ with tab_schema:
         st.info("No project prefixes available in the loaded report.")
     else:
         entry = prefix_index.get(selected, {})
-        stage_fields = entry.get("stage_fields") or {}
-        beta_fields = entry.get("beta_fields") or {}
-        cmp = entry.get("comparison") or {}
-        stage_ecs = ((entry.get("ecs") or {}).get("stage") or {})
-        beta_ecs = ((entry.get("ecs") or {}).get("beta") or {})
+        mapped_fields = entry_fields(entry)
+        issues = entry.get("issues") or {}
+        ecs_info = normalize_ecs(entry.get("ecs"))
+        idx_name = entry_index_name(entry)
 
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Stage Index", entry.get("stage_index") or "MISSING")
-        m2.metric("Beta Index", entry.get("beta_index") or "MISSING")
-        m3.metric("Beta Prefix", entry.get("beta_prefix") or "—")
-        m4.metric("Total Fields", len(set(stage_fields) | set(beta_fields)))
-        m5.metric(
-            "Status",
-            entry.get("status") or "—",
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Index", idx_name or "MISSING")
+        m2.metric("Total Fields", len(mapped_fields))
+        m3.metric(
+            "ECS Score",
+            (
+                f"{ecs_info.get('ecs_fields_present', 0)}/"
+                f"{ecs_info.get('ecs_fields_total', 5)}"
+                if ecs_info
+                else "—"
+            ),
         )
+        m4.metric("Status", entry.get("status") or "—")
 
-        if not entry.get("stage_index"):
+        if not idx_name:
             st.warning(
-                f"Stage index missing for `{selected}` on `{selected_day}` "
-                f"(`*-{day_suffix}`). Showing Beta-only mapping if present."
+                f"Index missing for `{selected}` on `{selected_day}` "
+                f"(`*-{day_suffix}`)."
             )
 
         if entry.get("error"):
             st.error(entry["error"])
 
-        f1, f2, f3, f4 = st.columns(4)
-        f1.metric("Schema Drift", "Yes" if entry.get("has_schema_drift") else "No")
-        f2.metric("Type Mismatch", "Yes" if entry.get("has_type_mismatch") else "No")
-        f3.metric(
-            "Stage ECS",
-            (
-                f"{stage_ecs.get('ecs_fields_present', 0)}/"
-                f"{stage_ecs.get('ecs_fields_total', 5)}"
-                if stage_ecs
-                else "—"
-            ),
-        )
-        f4.metric(
-            "Beta ECS",
-            (
-                f"{beta_ecs.get('ecs_fields_present', 0)}/"
-                f"{beta_ecs.get('ecs_fields_total', 5)}"
-                if beta_ecs
-                else "—"
-            ),
+        f1, f2 = st.columns(2)
+        f1.metric("Schema Issues", "Yes" if entry.get("has_schema_drift") else "No")
+        f2.metric(
+            "ECS Gaps",
+            "Yes"
+            if (
+                entry.get("has_ecs_gaps")
+                or issues.get("missing_ecs_fields")
+                or not ecs_info.get("ecs_ready", False)
+            )
+            else "No",
         )
 
-        s1, s2 = st.columns(2)
-        s1.info(f"**Stage size:** {_size_label(entry.get('stage_size'))}")
-        s2.info(f"**Beta size:** {_size_label(entry.get('beta_size'))}")
+        st.info(f"**Size:** {_size_label(entry_index_size(entry))}")
 
         st.markdown("##### ECS checklist")
         st.caption(
             "Core ECS fields vs legacy alternatives found in the mapping "
             "(legacy names do not raise the ECS score until remapped)."
         )
-        ecs_left, ecs_right = st.columns(2)
-        with ecs_left:
-            st.markdown(
-                f"**Stage** — ready: `{bool(stage_ecs.get('ecs_ready'))}`"
-            )
-            st.dataframe(
-                _ecs_checklist_df(stage_ecs),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "present": st.column_config.CheckboxColumn("Present"),
-                    "legacy_alternatives": st.column_config.TextColumn(
-                        "Legacy Alternatives", width="large"
-                    ),
-                },
-            )
-        with ecs_right:
-            st.markdown(
-                f"**Beta** — ready: `{bool(beta_ecs.get('ecs_ready')) if beta_ecs else False}`"
-            )
-            st.dataframe(
-                _ecs_checklist_df(beta_ecs),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "present": st.column_config.CheckboxColumn("Present"),
-                    "legacy_alternatives": st.column_config.TextColumn(
-                        "Legacy Alternatives", width="large"
-                    ),
-                },
-            )
+        st.markdown(f"**ECS ready:** `{bool(ecs_info.get('ecs_ready'))}`")
+        st.dataframe(
+            _ecs_checklist_df(ecs_info),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "present": st.column_config.CheckboxColumn("Present"),
+                "legacy_alternatives": st.column_config.TextColumn(
+                    "Legacy Alternatives", width="large"
+                ),
+            },
+        )
 
-        st.markdown("##### Stage ↔ Beta field diff")
-        d1, d2, d3 = st.columns(3)
-        with d1:
+        st.markdown("##### ECS gaps")
+        g1, g2 = st.columns(2)
+        with g1:
             _render_list_table(
-                "Missing in Stage (present in Beta)",
-                list(cmp.get("missing_in_stage") or []),
-                "None",
+                "Missing required ECS fields",
+                list(issues.get("missing_ecs_fields") or []),
+                "None — all core ECS fields present",
             )
-        with d2:
-            _render_list_table(
-                "Missing in Beta (present in Stage)",
-                list(cmp.get("missing_in_beta") or []),
-                "None",
-            )
-        with d3:
-            mismatches = list(cmp.get("type_mismatches") or [])
-            st.markdown(f"**Type mismatches** ({len(mismatches)})")
-            if not mismatches:
+        with g2:
+            legacy_rows = list(issues.get("legacy_ecs_alternatives") or [])
+            st.markdown(f"**Legacy ECS alternatives** ({len(legacy_rows)})")
+            if not legacy_rows:
                 st.caption("None")
             else:
                 st.dataframe(
-                    pd.DataFrame(mismatches),
-                    use_container_width=True,
+                    pd.DataFrame(legacy_rows),
+                    width="stretch",
                     hide_index=True,
                 )
 
-        left, right = st.columns(2)
-        with left:
-            st.subheader("Stage mapping")
-            st.caption(f"{len(stage_fields)} mapped fields")
-            with st.expander("View Full YAML Mapping", expanded=False):
-                st.code(_fields_to_yaml(stage_fields), language="yaml")
-        with right:
-            st.subheader("Beta mapping")
-            st.caption(f"{len(beta_fields)} mapped fields")
-            with st.expander("View Full YAML Mapping", expanded=False):
-                st.code(_fields_to_yaml(beta_fields), language="yaml")
+        st.subheader("Index mapping")
+        st.caption(f"{len(mapped_fields)} mapped fields")
+        with st.expander("View Full YAML Mapping", expanded=False):
+            st.code(_fields_to_yaml(mapped_fields), language="yaml")
 
 # ---------------------------------------------------------------------------
 # Tab — Fields
@@ -1119,13 +1077,12 @@ with tab_schema:
 with tab_fields:
     st.markdown("##### All mapped fields")
     st.caption(
-        "Full `all_index_mappings.csv` inventory — filter by project, ECS, "
-        "type mismatch, or presence in both environments."
+        "Full `all_index_mappings.csv` inventory — filter by project or ECS standard."
     )
 
-    fc1, fc2, fc3, fc4 = st.columns(4)
+    fc1, fc2 = st.columns(2)
     with fc1:
-        project_filter = st.multiselect(
+        fields_project_filter = st.multiselect(
             "Projects",
             options=sorted(mappings_df["project_prefix"].dropna().unique()),
             default=[],
@@ -1136,143 +1093,142 @@ with tab_fields:
             options=["All", "ECS only", "Non-ECS only"],
             index=0,
         )
-    with fc3:
-        mismatch_filter = st.selectbox(
-            "Type mismatch",
-            options=["All", "Mismatches only", "No mismatches"],
-            index=0,
-        )
-    with fc4:
-        both_filter = st.selectbox(
-            "Environment presence",
-            options=["All", "In both envs", "Missing in one env"],
-            index=0,
-        )
 
     search = st.text_input("Search field name", placeholder="e.g. Properties.elapsed")
 
     view = mappings_df
-    if project_filter:
-        view = view[view["project_prefix"].isin(project_filter)]
+    if fields_project_filter:
+        view = view[view["project_prefix"].isin(fields_project_filter)]
     if ecs_filter == "ECS only":
         view = view[view["is_ecs_standard"]]
     elif ecs_filter == "Non-ECS only":
         view = view[~view["is_ecs_standard"]]
-    if mismatch_filter == "Mismatches only":
-        view = view[view["is_type_mismatch"]]
-    elif mismatch_filter == "No mismatches":
-        view = view[~view["is_type_mismatch"]]
-    if both_filter == "In both envs":
-        view = view[view["exists_in_both_envs"]]
-    elif both_filter == "Missing in one env":
-        view = view[~view["exists_in_both_envs"]]
     if search.strip():
         view = view[
-            view["field_name"].astype(str).str.contains(search.strip(), case=False, na=False)
+            view["field_name"]
+            .astype(str)
+            .str.contains(search.strip(), case=False, na=False)
         ]
 
     st.caption(f"Showing {len(view):,} / {len(mappings_df):,} field rows")
     st.dataframe(
         view,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "project_prefix": st.column_config.TextColumn("Project", width="medium"),
             "field_name": st.column_config.TextColumn("Field", width="large"),
-            "beta_resolved_index": st.column_config.TextColumn("Beta Index"),
-            "stage_resolved_index": st.column_config.TextColumn("Stage Index"),
-            "beta_data_type": st.column_config.TextColumn("Beta Type", width="small"),
-            "stage_data_type": st.column_config.TextColumn("Stage Type", width="small"),
+            "resolved_index": st.column_config.TextColumn("Index"),
+            "data_type": st.column_config.TextColumn("Type", width="small"),
             "is_ecs_standard": st.column_config.CheckboxColumn("ECS"),
-            "is_type_mismatch": st.column_config.CheckboxColumn("Type Mismatch"),
-            "exists_in_both_envs": st.column_config.CheckboxColumn("In Both Envs"),
         },
     )
 
 # ---------------------------------------------------------------------------
-# Tab — Conflicts
+# Tab — Conflicts (schema / ECS issues)
 # ---------------------------------------------------------------------------
 with tab_conflicts:
-    conflicts_df = mappings_df[
-        mappings_df["is_type_mismatch"] | ~mappings_df["exists_in_both_envs"]
-    ].copy()
-    type_only = conflicts_df[conflicts_df["is_type_mismatch"]]
-    missing_env = conflicts_df[~conflicts_df["exists_in_both_envs"]]
+    ecs_gap_rows = []
+    missing_index_rows = []
+    for entry in comparison_data.get("results") or []:
+        prefix = entry.get("prefix")
+        ecs_info = normalize_ecs(entry.get("ecs"))
+        issues = entry.get("issues") or {}
+        missing_ecs = list(issues.get("missing_ecs_fields") or [])
+        idx_name = entry_index_name(entry)
+        if not idx_name:
+            missing_index_rows.append(
+                {
+                    "project_prefix": prefix,
+                    "status": entry.get("status"),
+                    "error": entry.get("error") or "",
+                }
+            )
+        elif missing_ecs or not ecs_info.get("ecs_ready", False):
+            for field in missing_ecs or ["(not ecs_ready)"]:
+                detail = ((ecs_info.get("fields") or {}).get(field) or {})
+                ecs_gap_rows.append(
+                    {
+                        "project_prefix": prefix,
+                        "index_name": idx_name,
+                        "missing_ecs_field": field,
+                        "status": detail.get("status") or "missing",
+                        "legacy_alternatives": ", ".join(
+                            detail.get("legacy_alternatives_found") or []
+                        ),
+                        "ecs_score": (
+                            f"{ecs_info.get('ecs_fields_present', 0)}/"
+                            f"{ecs_info.get('ecs_fields_total', 5)}"
+                        ),
+                    }
+                )
+
+    ecs_gaps_df = pd.DataFrame(ecs_gap_rows)
+    missing_index_df = pd.DataFrame(missing_index_rows)
+
+    non_ecs_fields = mappings_df[~mappings_df["is_ecs_standard"]].copy()
 
     st.markdown(
         f'<div class="conflict-banner">'
-        f"⚠️ High-priority schema conflicts: "
-        f"<strong>{len(conflicts_df):,}</strong> field rows "
-        f"({len(type_only):,} type mismatches · "
-        f"{len(missing_env):,} missing across environments)"
+        f"⚠️ Elasticsearch Schema Issues: "
+        f"<strong>{len(ecs_gaps_df):,}</strong> missing required ECS field rows · "
+        f"<strong>{len(missing_index_df):,}</strong> services without index · "
+        f"<strong>{len(non_ecs_fields):,}</strong> non-ECS field mappings"
         f"</div>",
         unsafe_allow_html=True,
     )
 
-    # Structured mismatches from JSON (cleaner than CSV for blockers)
-    structured_rows = []
-    for entry in comparison_data.get("results") or []:
-        for item in (entry.get("comparison") or {}).get("type_mismatches") or []:
-            structured_rows.append(
-                {
-                    "project_prefix": entry.get("prefix"),
-                    "field": item.get("field"),
-                    "stage_type": item.get("stage_type"),
-                    "beta_type": item.get("beta_type"),
-                    "stage_index": entry.get("stage_index"),
-                    "beta_index": entry.get("beta_index"),
-                    "beta_prefix": entry.get("beta_prefix"),
-                }
-            )
-    structured_df = pd.DataFrame(structured_rows)
-
-    st.markdown("##### Structured type mismatches (from comparison JSON)")
-    if structured_df.empty:
-        st.success("No cross-environment type mismatches detected.")
+    st.markdown("##### Missing required ECS fields")
+    if ecs_gaps_df.empty:
+        st.success("All indexes have the core ECS fields present.")
     else:
-        st.dataframe(structured_df, use_container_width=True, hide_index=True)
+        st.dataframe(ecs_gaps_df, width="stretch", hide_index=True)
 
-    st.markdown("##### Conflict field inventory (CSV)")
-    st.dataframe(
-        conflicts_df.sort_values(
-            by=["is_type_mismatch", "field_name", "project_prefix"],
-            ascending=[False, True, True],
-        ),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "project_prefix": st.column_config.TextColumn("Project", width="medium"),
-            "field_name": st.column_config.TextColumn("Field", width="large"),
-            "beta_data_type": st.column_config.TextColumn("Beta Type", width="small"),
-            "stage_data_type": st.column_config.TextColumn("Stage Type", width="small"),
-            "is_type_mismatch": st.column_config.CheckboxColumn("Type Mismatch"),
-            "exists_in_both_envs": st.column_config.CheckboxColumn("In Both Envs"),
-            "is_ecs_standard": st.column_config.CheckboxColumn("ECS"),
-        },
+    st.markdown("##### Services missing index")
+    if missing_index_df.empty:
+        st.caption("None for this filter/day.")
+    else:
+        st.dataframe(missing_index_df, width="stretch", hide_index=True)
+
+    st.markdown("##### Non-ECS field inventory")
+    st.caption(
+        "Mapped fields that are not ECS-standard paths — candidates for "
+        "Fluentd mutate / remapping."
     )
+    if non_ecs_fields.empty:
+        st.caption("No non-ECS fields in the current filter.")
+    else:
+        st.dataframe(
+            non_ecs_fields.sort_values(
+                by=["project_prefix", "field_name"],
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "project_prefix": st.column_config.TextColumn(
+                    "Project", width="medium"
+                ),
+                "field_name": st.column_config.TextColumn("Field", width="large"),
+                "data_type": st.column_config.TextColumn("Type", width="small"),
+                "is_ecs_standard": st.column_config.CheckboxColumn("ECS"),
+            },
+        )
 
-    st.markdown("##### Blocking fields (grouped by field name)")
-    if type_only.empty:
-        st.caption("No type-mismatch rows to group.")
+    st.markdown("##### Blocking ECS fields (grouped)")
+    if ecs_gaps_df.empty:
+        st.caption("No missing ECS fields to group.")
     else:
         grouped = (
-            type_only.groupby("field_name", as_index=False)
+            ecs_gaps_df.groupby("missing_ecs_field", as_index=False)
             .agg(
                 projects=("project_prefix", lambda s: ", ".join(sorted(set(s)))),
                 project_count=("project_prefix", "nunique"),
-                beta_types=(
-                    "beta_data_type",
-                    lambda s: ", ".join(sorted(set(map(str, s)))),
-                ),
-                stage_types=(
-                    "stage_data_type",
-                    lambda s: ", ".join(sorted(set(map(str, s)))),
-                ),
-                mismatch_rows=("field_name", "size"),
+                statuses=("status", lambda s: ", ".join(sorted(set(map(str, s))))),
+                gap_rows=("missing_ecs_field", "size"),
             )
-            .sort_values(["project_count", "field_name"], ascending=[False, True])
+            .sort_values(["project_count", "missing_ecs_field"], ascending=[False, True])
         )
-        st.dataframe(grouped, use_container_width=True, hide_index=True)
+        st.dataframe(grouped, width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------------------
 # Tab — Compare days
@@ -1332,15 +1288,15 @@ with tab_compare:
                 delta_color="inverse",
             )
             c4.metric(
-                "Schema Drift",
+                "Schema Issues",
                 cur_kpis["schema_drift"],
                 delta=cur_kpis["schema_drift"] - base_kpis["schema_drift"],
                 delta_color="inverse",
             )
             c5.metric(
-                "Type Conflicts",
-                cur_kpis["type_conflicts"],
-                delta=cur_kpis["type_conflicts"] - base_kpis["type_conflicts"],
+                "ECS Gap Projects",
+                cur_kpis["ecs_gap_projects"],
+                delta=cur_kpis["ecs_gap_projects"] - base_kpis["ecs_gap_projects"],
                 delta_color="inverse",
             )
 
@@ -1352,35 +1308,47 @@ with tab_compare:
                 diff_df[diff_df["change"] != "unchanged"] if only_changes else diff_df
             )
 
-            st.markdown("##### Per-project deltas")
+            st.markdown("##### Per-project comparison")
+            st.caption(
+                f"Fields, docs, index size, and avg doc size for "
+                f"`{baseline_day}` vs `{selected_day}`."
+            )
             st.dataframe(
                 view,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "project_prefix": st.column_config.TextColumn(
                         "Project", width="medium"
                     ),
                     "change": st.column_config.TextColumn("Change", width="small"),
-                    "stage_fields_Δ": st.column_config.NumberColumn(
-                        "Stage Fields Δ", format="%+d"
+                    "fields_baseline": st.column_config.NumberColumn(
+                        f"Fields ({baseline_day})", format="%d"
                     ),
-                    "beta_fields_Δ": st.column_config.NumberColumn(
-                        "Beta Fields Δ", format="%+d"
+                    "fields_current": st.column_config.NumberColumn(
+                        f"Fields ({selected_day})", format="%d"
                     ),
-                    "ecs_fields_Δ": st.column_config.NumberColumn(
-                        "ECS Fields Δ", format="%+d"
+                    "fields_Δ": st.column_config.NumberColumn(
+                        "Fields Δ", format="%+d"
                     ),
-                    "type_mismatches_Δ": st.column_config.NumberColumn(
-                        "Type Mismatches Δ", format="%+d"
+                    "docs_baseline": st.column_config.NumberColumn(
+                        f"Docs ({baseline_day})", format="%d"
                     ),
-                    "stage_docs_Δ": st.column_config.NumberColumn(
-                        "Stage Docs Δ", format="%+d"
+                    "docs_current": st.column_config.NumberColumn(
+                        f"Docs ({selected_day})", format="%d"
                     ),
-                    "beta_docs_Δ": st.column_config.NumberColumn(
-                        "Beta Docs Δ", format="%+d"
+                    "docs_Δ": st.column_config.NumberColumn("Docs Δ", format="%+d"),
+                    "size_baseline": st.column_config.TextColumn(
+                        f"Size ({baseline_day})"
                     ),
-                    "format_old": st.column_config.TextColumn("Format (baseline)"),
-                    "format_new": st.column_config.TextColumn("Format (current)"),
+                    "size_current": st.column_config.TextColumn(
+                        f"Size ({selected_day})"
+                    ),
+                    "avg_doc_baseline": st.column_config.TextColumn(
+                        f"Avg Doc ({baseline_day})"
+                    ),
+                    "avg_doc_current": st.column_config.TextColumn(
+                        f"Avg Doc ({selected_day})"
+                    ),
                 },
             )

@@ -2,15 +2,12 @@
 """
 Discover Elasticsearch index prefixes and merge them into prefixes.json.
 
-Connects to Stage (default) or Beta, lists indices, normalizes service prefixes
-and core domain namespaces, then safely merges into prefixes.json without
-removing existing manual entries.
+Connects to the ELK/Elasticsearch cluster, lists indices, normalizes service
+prefixes and core domain namespaces, then safely merges into prefixes.json
+without removing existing manual entries.
 
 Usage:
   python discover_prefixes.py
-  python discover_prefixes.py --cluster stage
-  python discover_prefixes.py --cluster beta
-  DISCOVER_CLUSTER=beta python discover_prefixes.py
   PREFIX_FILTER=mic python discover_prefixes.py   # only merge/report mic-*
 """
 
@@ -23,7 +20,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from elasticsearch import Elasticsearch
@@ -104,30 +101,24 @@ def _parse_url_auth(url: str) -> Tuple[str, Optional[Tuple[str, str]]]:
     return url, None
 
 
-def build_client(cluster: str) -> Elasticsearch:
-    cluster = cluster.lower().strip()
-    if cluster == "beta":
-        url_env, user_env, pass_env, label = (
-            "BETA_ES_URL",
-            "BETA_ES_USER",
-            "BETA_ES_PASSWORD",
-            "Beta",
-        )
-    else:
-        url_env, user_env, pass_env, label = (
-            "STAGE_ES_URL",
-            "STAGE_ES_USER",
-            "STAGE_ES_PASSWORD",
-            "Stage",
-        )
+def _env_first(*names: str) -> Optional[str]:
+    for name in names:
+        val = os.environ.get(name)
+        if val is not None and str(val).strip() != "":
+            return val
+    return None
 
-    url = os.environ.get(url_env)
+
+def build_client() -> Elasticsearch:
+    url = _env_first("ES_URL", "STAGE_ES_URL")
     if not url:
-        raise SystemExit(f"Missing {label} URL. Set {url_env} in .env or the environment.")
+        raise SystemExit(
+            "Missing Elasticsearch URL. Set ES_URL in .env or the environment."
+        )
 
     url, url_auth = _parse_url_auth(url)
-    user = os.environ.get(user_env)
-    password = os.environ.get(pass_env)
+    user = _env_first("ES_USER", "STAGE_ES_USER")
+    password = _env_first("ES_PASSWORD", "STAGE_ES_PASSWORD")
     http_auth = None
     if user is not None and password is not None:
         http_auth = (user, password)
@@ -233,7 +224,6 @@ def apply_prefix_filter(
     filtered_services = {
         s for s in services if matches_prefix_filter(s, teams, exact)
     }
-    # Domains: keep teams from filter, plus domains still present on filtered services.
     filtered_domains = set(teams) | {
         d for d in domains if matches_prefix_filter(d, teams, exact)
     }
@@ -286,7 +276,6 @@ def discover_from_cluster(es: Elasticsearch) -> Tuple[Set[str], Set[str]]:
             if domain:
                 domains.add(domain)
         else:
-            # Bare name without hyphen — treat as domain only if it looks like one
             domains.add(service.lower())
 
     return services, domains
@@ -339,7 +328,6 @@ def merge_and_report(
 
 
 def print_summary(
-    cluster: str,
     merged: Dict[str, List[str]],
     new_services: List[str],
     new_domains: List[str],
@@ -349,7 +337,7 @@ def print_summary(
     removed_services: int = 0,
 ) -> None:
     print("=" * 72)
-    print(f" Prefix discovery — cluster={cluster}")
+    print(" Elasticsearch Prefix Discovery")
     if prefix_filter:
         print(
             f" PREFIX_FILTER={prefix_filter!r} "
@@ -396,12 +384,8 @@ def print_summary(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Discover ES index prefixes into prefixes.json")
-    parser.add_argument(
-        "--cluster",
-        choices=("stage", "beta"),
-        default=os.environ.get("DISCOVER_CLUSTER", "stage").lower(),
-        help="Cluster to scan (default: stage, or DISCOVER_CLUSTER)",
+    parser = argparse.ArgumentParser(
+        description="Discover Elasticsearch index prefixes into prefixes.json"
     )
     parser.add_argument(
         "--dry-run",
@@ -415,12 +399,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     _load_env()
-    es = build_client(args.cluster)
+    es = build_client()
     try:
         if not es.ping():
-            print(f"WARNING: {args.cluster} ping failed", file=sys.stderr)
+            print("WARNING: Elasticsearch ping failed", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001
-        print(f"WARNING: {args.cluster} ping error: {exc}", file=sys.stderr)
+        print(f"WARNING: Elasticsearch ping error: {exc}", file=sys.stderr)
 
     existing = load_prefixes(PREFIXES_FILE)
     discovered_services, discovered_domains = discover_from_cluster(es)
@@ -435,7 +419,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     print_summary(
-        args.cluster,
         merged,
         new_services,
         new_domains,

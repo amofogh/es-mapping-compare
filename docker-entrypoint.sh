@@ -50,7 +50,7 @@ case "$mode" in
     echo "==> prefixes.json updated."
     ;;
   compare|mappings)
-    echo "==> Comparing mappings (ENABLE_BETA=${ENABLE_BETA:-false})..."
+    echo "==> Analyzing Elasticsearch mappings..."
     set +e
     python compare_es_mappings.py
     code=$?
@@ -63,7 +63,7 @@ case "$mode" in
   all)
     echo "==> [1/2] Discovering index prefixes..."
     python discover_prefixes.py
-    echo "==> [2/2] Comparing mappings (ENABLE_BETA=${ENABLE_BETA:-false})..."
+    echo "==> [2/2] Analyzing Elasticsearch mappings..."
     set +e
     python compare_es_mappings.py
     code=$?
