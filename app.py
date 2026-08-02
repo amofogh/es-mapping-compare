@@ -1170,12 +1170,6 @@ elif wrong_day_count:
         f"⚠️ **{wrong_day_count}** microservices emitted no logs on "
         f"**{selected_day}** (showing last known index mappings)."
     )
-    if st.button(
-        "🔍 Triage Mismatched Services",
-        key="triage_mismatched_services_btn",
-        type="primary",
-    ):
-        st.session_state["main_dashboard_tab"] = "⚠️ Conflicts"
 
 MAIN_TAB_OPTIONS = [
     "🚀 Readiness",
