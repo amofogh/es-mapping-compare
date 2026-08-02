@@ -11,6 +11,7 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import yaml
 
 from compare_es_mappings import (
@@ -56,70 +57,70 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
-# UI theme toggle (dark by default). Component CSS uses theme tokens — not fixed slate hex.
+# UI theme toggle (dark by default). Syncs Streamlit's native theme so
+# dataframes / selects / date inputs actually retheme (canvas + BaseWeb).
 if "ui_theme" not in st.session_state:
-    st.session_state.ui_theme = "dark"
+    # Prefer URL ?theme= when present (survives full reload).
+    _qp_theme = str(st.query_params.get("theme", "") or "").lower()
+    st.session_state.ui_theme = (
+        _qp_theme if _qp_theme in {"dark", "light"} else "dark"
+    )
 
 _UI_THEME = st.session_state.ui_theme
 _IS_DARK = _UI_THEME == "dark"
+_NATIVE_THEME_NAME = "Dark" if _IS_DARK else "Light"
 
-# Remap Streamlit-compatible tokens so light/dark both stay readable.
-_THEME_TOKEN_CSS = (
-    """
-    .stApp {
-      --background-color: #0b1220;
-      --secondary-background-color: #1e293b;
-      --background-secondary-color: #1e293b;
-      --text-color: #e2e8f0;
-      --text-color-subtle: #94a3b8;
-      --border-color: rgba(148, 163, 184, 0.28);
-      color-scheme: dark;
-    }
-    """
-    if _IS_DARK
-    else """
-    .stApp {
-      --background-color: #ffffff;
-      --secondary-background-color: #f0f2f6;
-      --background-secondary-color: #f0f2f6;
-      --text-color: #31333f;
-      --text-color-subtle: #64748b;
-      --border-color: rgba(49, 51, 63, 0.2);
-      color-scheme: light;
-    }
-    """
+# Keep query param in sync for reload persistence.
+if st.query_params.get("theme") != _UI_THEME:
+    st.query_params["theme"] = _UI_THEME
+
+# Apply Streamlit native theme via localStorage (Light/Dark), then reload once.
+components.html(
+    f"""
+    <script>
+    (function () {{
+      const desired = {_NATIVE_THEME_NAME!r};
+      const path = window.parent.location.pathname;
+      const key = `stActiveTheme-${{path}}-v2`;
+      let current = null;
+      try {{
+        const raw = window.parent.localStorage.getItem(key);
+        current = raw ? JSON.parse(raw) : null;
+      }} catch (e) {{
+        current = null;
+      }}
+      if (current !== desired) {{
+        window.parent.localStorage.setItem(key, JSON.stringify(desired));
+        window.parent.location.reload();
+      }}
+    }})();
+    </script>
+    """,
+    height=0,
 )
 
 st.markdown(
-    f"""
+    """
     <style>
-    {_THEME_TOKEN_CSS}
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
 
-    #MainMenu {{visibility: hidden;}}
-    footer {{visibility: hidden;}}
-    header {{visibility: hidden;}}
-
-    .stApp {{
-        background-color: var(--background-color);
-        color: var(--text-color);
-    }}
-
-    .block-container {{
+    .block-container {
         padding-top: 1.25rem;
         padding-bottom: 2rem;
         max-width: 1480px;
-    }}
+    }
 
-    h1 {{
+    h1 {
         letter-spacing: -0.02em;
         margin-bottom: 0.35rem !important;
-        color: var(--text-color, inherit) !important;
-    }}
+    }
 
-    /* Metrics — theme-relative surfaces (no hardcoded slate) */
-    div[data-testid="stMetric"] {{
-        background-color: var(--background-secondary-color, rgba(125, 125, 125, 0.05));
-        border: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
+    /* Metrics — subtle cards on top of Streamlit theme surfaces */
+    div[data-testid="stMetric"] {
+        background-color: var(--secondary-background-color, rgba(125, 125, 125, 0.06));
+        border: 1px solid rgba(125, 125, 125, 0.22);
         border-radius: 12px;
         padding: 1rem;
         height: 100%;
@@ -128,85 +129,79 @@ st.markdown(
         flex-direction: column;
         justify-content: center;
         box-sizing: border-box;
-    }}
+    }
 
-    div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) {{
+    div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) {
         align-items: stretch;
-    }}
+    }
 
     div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"])
-      > div[data-testid="stColumn"] {{
+      > div[data-testid="stColumn"] {
         flex: 1 1 0 !important;
         width: 0 !important;
         min-width: 0 !important;
-    }}
+    }
 
-    div[data-testid="stMetric"] label {{
-        color: var(--text-color-subtle, inherit) !important;
-        opacity: 0.8;
+    div[data-testid="stMetric"] label {
+        color: inherit !important;
+        opacity: 0.75;
         min-height: 2.4rem;
         display: flex;
         align-items: flex-end;
         line-height: 1.2;
-    }}
+    }
 
-    div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
-        color: var(--text-color, inherit) !important;
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        color: inherit !important;
         font-weight: 700;
         font-size: 1.75rem !important;
-    }}
+    }
 
-    .stTabs [data-baseweb="tab-list"] {{
+    .stTabs [data-baseweb="tab-list"] {
         gap: 0.35rem;
-        border-bottom: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
+        border-bottom: 1px solid rgba(125, 125, 125, 0.22);
         flex-wrap: wrap;
-    }}
+    }
 
-    .stTabs [data-baseweb="tab"] {{
+    .stTabs [data-baseweb="tab"] {
         border-radius: 8px 8px 0 0;
         padding: 0.55rem 0.9rem;
         font-weight: 600;
-    }}
+    }
 
-    /* Tab bar (st.radio) — adaptive, no dark fill overrides on inputs */
-    div[data-testid="stRadio"] > div {{
+    div[data-testid="stRadio"] > div {
         flex-wrap: wrap;
         gap: 0.35rem;
-        border-bottom: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
+        border-bottom: 1px solid rgba(125, 125, 125, 0.22);
         padding-bottom: 0.45rem;
         margin-bottom: 0.65rem;
-    }}
-    div[data-testid="stRadio"] label {{
-        background-color: var(--background-secondary-color, rgba(125, 125, 125, 0.05));
-        border: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
+    }
+    div[data-testid="stRadio"] label {
+        background-color: var(--secondary-background-color, rgba(125, 125, 125, 0.06));
+        border: 1px solid rgba(125, 125, 125, 0.22);
         border-radius: 8px 8px 0 0;
         padding: 0.4rem 0.75rem !important;
         font-weight: 600;
-        color: var(--text-color, inherit) !important;
-    }}
+    }
 
-    /* Alerts: readable text on yellow/red tints in light mode */
     .stAlert,
-    div[data-testid="stAlert"] {{
+    div[data-testid="stAlert"] {
         border-radius: 10px;
-    }}
+    }
+    /* Readable text on yellow warning / red error tints */
     div[data-testid="stAlert"] [data-testid="stMarkdownContainer"],
-    div[data-testid="stAlert"] [data-testid="stMarkdownContainer"] p,
-    div[data-testid="stAlert"] [data-testid="stMarkdownContainer"] span,
-    div[data-testid="stAlert"] [data-testid="stMarkdownContainer"] strong,
-    div[data-testid="stAlert"] [data-testid="stMarkdownContainer"] code {{
+    div[data-testid="stAlert"] [data-testid="stMarkdownContainer] * {
         color: #1e293b !important;
-    }}
+    }
 
-    /* Status / info cards — adaptive surfaces */
     .efk-status-bar,
-    .efk-info-card {{
-        background-color: var(--background-secondary-color, rgba(125, 125, 125, 0.05));
-        border: 1px solid rgba(125, 125, 125, 0.2);
-        color: var(--text-color, inherit);
+    .efk-info-card {
+        background-color: var(--secondary-background-color, rgba(125, 125, 125, 0.06));
+        border: 1px solid rgba(125, 125, 125, 0.22);
+        color: inherit;
         border-radius: 10px;
-    }}
-    .efk-status-bar {{
+    }
+    .efk-status-bar {
         display: flex;
         flex-direction: column;
         gap: 0.45rem;
@@ -214,44 +209,42 @@ st.markdown(
         margin: 0.35rem 0 0.85rem 0;
         font-size: 0.92rem;
         line-height: 1.5;
-    }}
-    .efk-status-bar .efk-status-row {{
+    }
+    .efk-status-bar .efk-status-row {
         display: flex;
         flex-wrap: wrap;
         align-items: center;
         gap: 0.3rem 0.65rem;
-    }}
-    .efk-status-bar .efk-status-sep {{
-        color: var(--text-color-subtle, inherit);
-        opacity: 0.7;
+    }
+    .efk-status-bar .efk-status-sep {
+        opacity: 0.55;
         user-select: none;
-    }}
+    }
     .efk-status-bar code,
     .efk-days-found code,
-    .efk-info-card code {{
+    .efk-info-card code {
         background-color: rgba(125, 125, 125, 0.15);
-        color: var(--text-color, inherit);
+        color: inherit;
         padding: 0.1rem 0.35rem;
         border-radius: 4px;
-    }}
+    }
 
-    .efk-days-found {{
-        color: var(--text-color-subtle, inherit);
+    .efk-days-found {
+        opacity: 0.85;
         font-size: 0.88rem;
         line-height: 1.55;
         margin: 0.15rem 0 0.55rem 0;
-    }}
-    .efk-days-found div + div {{
+    }
+    .efk-days-found div + div {
         margin-top: 0.2rem;
-    }}
+    }
 
-    div[data-testid="stExpander"] {{
-        border: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
+    div[data-testid="stExpander"] {
+        border: 1px solid rgba(125, 125, 125, 0.22);
         border-radius: 10px;
-        background-color: var(--background-secondary-color, rgba(125, 125, 125, 0.05));
-    }}
+    }
 
-    .conflict-banner {{
+    .conflict-banner {
         background: linear-gradient(90deg, #7f1d1d 0%, #991b1b 55%, #b45309 100%);
         color: #fff7ed;
         padding: 0.85rem 1.1rem;
@@ -259,45 +252,43 @@ st.markdown(
         font-weight: 600;
         margin-bottom: 0.75rem;
         border: 1px solid #fca5a5;
-    }}
+    }
 
-    .efk-info-card {{
+    .efk-info-card {
         padding: 1.15rem 1.35rem;
         margin: 0.35rem 0 1.1rem 0;
         line-height: 1.55;
         border-radius: 12px;
-    }}
-    .efk-info-card h3 {{
+    }
+    .efk-info-card h3 {
         margin: 0 0 0.75rem 0;
-        color: var(--text-color, inherit);
         font-size: 1.15rem;
-    }}
-    .efk-info-card dl {{
+    }
+    .efk-info-card dl {
         margin: 0;
         display: grid;
         grid-template-columns: minmax(140px, 200px) 1fr;
         gap: 0.45rem 1rem;
-    }}
-    .efk-info-card dt {{
-        color: var(--text-color-subtle, inherit);
+    }
+    .efk-info-card dt {
+        opacity: 0.75;
         font-weight: 600;
-    }}
-    .efk-info-card dd {{
+    }
+    .efk-info-card dd {
         margin: 0;
-        color: var(--text-color, inherit);
-    }}
+    }
 
-    div[data-testid="stHorizontalBlock"] button[kind="primary"] {{
+    div[data-testid="stHorizontalBlock"] button[kind="primary"] {
         min-height: 2.6rem;
         font-weight: 600;
-    }}
+    }
 
-    .efk-theme-row {{
+    .efk-theme-row {
         display: flex;
         justify-content: flex-end;
         align-items: center;
         padding-top: 0.55rem;
-    }}
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -958,9 +949,11 @@ with theme_col:
         toggle_label,
         key="ui_theme_toggle",
         width="stretch",
-        help="Switch dashboard colors. Default is dark mode.",
+        help="Switch Streamlit Light/Dark theme (tables & inputs included). Default is dark.",
     ):
-        st.session_state.ui_theme = "light" if _IS_DARK else "dark"
+        new_theme = "light" if _IS_DARK else "dark"
+        st.session_state.ui_theme = new_theme
+        st.query_params["theme"] = new_theme
         st.rerun()
 
 team_options = ["All"] + load_team_options()
