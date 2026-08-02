@@ -30,16 +30,37 @@ Typical questions it answers:
 
 ### Generated outputs (after a compare run)
 
-All generated files go under **`results/`** (not the project root):
+All generated files go under **`results/<run_id>/`** (not the project root).
+Each compare run creates a unique dated folder so prior runs are preserved:
+
+```
+results/
+  2026-08-01_142948/          # one run
+    mapping_comparison.json
+    all_index_mappings.csv
+    central_format_readiness.csv
+    index_field_counts.csv
+    all_index_mappings.yaml
+    index_mappings/<prefix>.yaml
+  2026-08-02_101500/          # later run
+  latest -> 2026-08-02_101500  # symlink to newest
+```
 
 | File | Description |
 |------|-------------|
-| `results/mapping_comparison.json` | Full machine-readable report |
-| `results/all_index_mappings.csv` | One row per field (`project_prefix`, `field_name`, Stage type, ECS flag) |
-| `results/central_format_readiness.csv` | Per-service summary + `core_team` + `target_log_format` |
-| `results/index_field_counts.csv` | Per-service Stage vs Beta: docs, index size, avg log size (no duplicate columns) |
-| `results/all_index_mappings.yaml` | All services in one YAML (Stage/Beta blocks + ES field types + diffs) |
-| `results/index_mappings/<prefix>.yaml` | One YAML file per service |
+| `mapping_comparison.json` | Full machine-readable report |
+| `all_index_mappings.csv` | One row per field (`project_prefix`, `field_name`, Stage type, ECS flag) |
+| `central_format_readiness.csv` | Per-service summary + `core_team` + `target_log_format` |
+| `index_field_counts.csv` | Per-service Stage vs Beta: docs, index size, avg log size (no duplicate columns) |
+| `all_index_mappings.yaml` | All services in one YAML (Stage/Beta blocks + ES field types + diffs) |
+| `index_mappings/<prefix>.yaml` | One YAML file per service |
+
+Pin a custom folder name with `RESULTS_RUN=my-label` (still under `results/`).
+Override the root with `RESULTS_DIR=/path/to/dir`.
+
+The Streamlit dashboard (`streamlit run app.py`) lets you pick any dated run and
+diff two runs under **Run Comparison**.
+
 
 ## Prerequisites
 
@@ -233,7 +254,8 @@ still cannot write fall back to `results_local/`.
 
 # Inspect outputs on the host
 ls results/
-ls results/index_mappings/ | head
+ls results/latest/
+ls results/latest/index_mappings/ | head
 ```
 
 Notes:
@@ -261,6 +283,28 @@ Run discover only:
 docker compose run --rm discover-prefixes
 ```
 
+### Streamlit panel (dashboard)
+
+Long-running UI over dated `results/<run_id>/` folders. Uses Compose profile
+`panel` so it is **not** started by the one-shot discover→compare pipeline.
+
+```bash
+docker compose --profile panel up -d --build panel
+# open http://localhost:8501
+
+# custom port
+PANEL_PORT=8502 docker compose --profile panel up -d panel
+
+docker compose --profile panel logs -f panel
+docker compose --profile panel down
+```
+
+Or locally without Docker:
+
+```bash
+streamlit run app.py
+```
+
 ## Quick reference
 
 ```bash
@@ -274,8 +318,9 @@ python discover_prefixes.py
 # edit prefixes.json if needed
 ENABLE_BETA=false python compare_es_mappings.py
 
-# inspect results
-less results/central_format_readiness.csv
-less results/index_field_counts.csv
-less results/index_mappings/ams-fundhub.yaml
+# inspect outputs
+less results/latest/central_format_readiness.csv
+less results/latest/index_field_counts.csv
+less results/latest/index_mappings/ams-fundhub.yaml
+docker compose --profile panel up -d --build panel   # http://localhost:8501
 ```

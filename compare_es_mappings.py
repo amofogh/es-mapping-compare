@@ -18,13 +18,17 @@ Usage:
   # Stage-only (default): ENABLE_BETA=false
   # Both clusters:       ENABLE_BETA=true
 
-Outputs (under ``results/``):
+Outputs (under ``results/<run_id>/``):
   - mapping_comparison.json
   - all_index_mappings.csv
   - central_format_readiness.csv
   - index_field_counts.csv
   - all_index_mappings.yaml
   - index_mappings/<prefix>.yaml
+
+Each compare run writes a unique dated folder (``YYYY-MM-DD_HHMMSS``) so
+previous runs are kept for side-by-side comparison. ``results/latest`` is a
+symlink to the most recent run. Override the folder name with ``RESULTS_RUN``.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -400,9 +405,20 @@ ECS_ROOT_NAMESPACES: Tuple[str, ...] = (
     "vulnerability",
 )
 
-RESULTS_DIR = Path(
+RESULTS_ROOT = Path(
     os.environ.get("RESULTS_DIR")
     or (Path(__file__).resolve().parent / "results")
+)
+# Back-compat alias: historically RESULTS_DIR was the write target.
+RESULTS_DIR = RESULTS_ROOT
+
+RUN_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(_\d{6})?$")
+RESULT_ARTIFACTS = (
+    "mapping_comparison.json",
+    "all_index_mappings.csv",
+    "central_format_readiness.csv",
+    "index_field_counts.csv",
+    "all_index_mappings.yaml",
 )
 
 
@@ -410,6 +426,8 @@ def resolve_results_dir(preferred: Optional[Path] = None) -> Path:
     """
     Prefer ``results/``; if Docker left it non-writable for the current user,
     fall back to ``results_local/`` so local runs still succeed.
+
+    Returns the **root** results directory (not a dated run folder).
     """
     base = Path(__file__).resolve().parent
     candidates: List[Path] = []
@@ -431,11 +449,6 @@ def resolve_results_dir(preferred: Optional[Path] = None) -> Path:
             probe = path / ".write_probe"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink(missing_ok=True)
-            # Also verify we can replace a typical artifact name if present.
-            sample = path / "mapping_comparison.json"
-            if sample.exists():
-                with open(sample, "a", encoding="utf-8"):
-                    pass
             return path
         except OSError:
             continue
@@ -444,6 +457,96 @@ def resolve_results_dir(preferred: Optional[Path] = None) -> Path:
     fallback = base / "results_local"
     fallback.mkdir(parents=True, exist_ok=True)
     return fallback
+
+
+def new_run_id(now: Optional[datetime] = None) -> str:
+    """Return ``YYYY-MM-DD_HHMMSS`` (UTC) for a unique run folder name."""
+    stamp = now or datetime.now(timezone.utc)
+    return stamp.strftime("%Y-%m-%d_%H%M%S")
+
+
+def make_run_dir(results_root: Path, run_id: Optional[str] = None) -> Path:
+    """
+    Create ``results_root/<run_id>/`` for this compare execution.
+
+    ``RESULTS_RUN`` env overrides the folder name (useful for CI / pinned labels).
+    """
+    override = (run_id or os.environ.get("RESULTS_RUN", "").strip() or "").strip()
+    rid = override or new_run_id()
+    # Keep path segment safe (no slashes).
+    rid = rid.replace("/", "-").replace("\\", "-")
+    run_dir = results_root / rid
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def point_latest_symlink(results_root: Path, run_dir: Path) -> None:
+    """Point ``results_root/latest`` at ``run_dir`` (best-effort)."""
+    link = results_root / "latest"
+    try:
+        if link.is_symlink() or link.is_file():
+            link.unlink()
+        elif link.is_dir() and not link.is_symlink():
+            # Do not wipe a real directory named latest.
+            return
+        link.symlink_to(run_dir.name, target_is_directory=True)
+    except OSError as exc:
+        logger.warning("Could not update results/latest symlink: %s", exc)
+
+
+def migrate_legacy_flat_results(results_root: Path) -> Optional[Path]:
+    """
+    If artifacts sit directly under ``results/`` (pre-dated layout), move them
+    into a dated run folder derived from ``generated_at`` or file mtime.
+    """
+    flat_json = results_root / "mapping_comparison.json"
+    if not flat_json.is_file():
+        return None
+
+    run_id = new_run_id()
+    try:
+        with flat_json.open(encoding="utf-8") as fh:
+            meta = json.load(fh)
+        generated = meta.get("generated_at")
+        if generated:
+            # e.g. 2026-08-01T14:29:48.438753Z
+            dt = datetime.fromisoformat(str(generated).replace("Z", "+00:00"))
+            run_id = dt.astimezone(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        try:
+            run_id = datetime.fromtimestamp(
+                flat_json.stat().st_mtime, tz=timezone.utc
+            ).strftime("%Y-%m-%d_%H%M%S")
+        except OSError:
+            pass
+
+    dest = results_root / run_id
+    if dest.exists():
+        run_id = f"{run_id}_migrated"
+        dest = results_root / run_id
+    dest.mkdir(parents=True, exist_ok=True)
+
+    moved: List[str] = []
+    for name in RESULT_ARTIFACTS:
+        src = results_root / name
+        if src.is_file():
+            shutil.move(str(src), str(dest / name))
+            moved.append(name)
+
+    mappings_dir = results_root / "index_mappings"
+    if mappings_dir.is_dir() and not mappings_dir.is_symlink():
+        shutil.move(str(mappings_dir), str(dest / "index_mappings"))
+        moved.append("index_mappings/")
+
+    if moved:
+        logger.info(
+            "Migrated legacy flat results into %s (%s)",
+            dest,
+            ", ".join(moved),
+        )
+        point_latest_symlink(results_root, dest)
+        return dest
+    return None
 
 
 OUTPUT_FILE = str(RESULTS_DIR / "mapping_comparison.json")
@@ -1998,19 +2101,26 @@ def main(
         return 1
 
     # Prefer results/; fall back to results_local/ when Docker left root/nobody files.
-    global RESULTS_DIR, OUTPUT_FILE, MAPPINGS_CSV_FILE, READINESS_CSV_FILE
+    global RESULTS_ROOT, RESULTS_DIR, OUTPUT_FILE, MAPPINGS_CSV_FILE, READINESS_CSV_FILE
     global FIELD_COUNTS_CSV_FILE, MAPPINGS_YAML_FILE, MAPPINGS_YAML_DIR
-    results_dir = resolve_results_dir(RESULTS_DIR)
-    if results_dir.resolve() != Path(
+    results_root = resolve_results_dir(RESULTS_ROOT)
+    preferred_root = Path(
         os.environ.get("RESULTS_DIR") or (Path(__file__).resolve().parent / "results")
-    ).resolve():
+    )
+    if results_root.resolve() != preferred_root.resolve():
         logger.warning(
             "Cannot write to results/ — using %s "
             "(fix with: docker compose run --rm --entrypoint /docker-entrypoint.sh "
             "es-mapping-compare fix-perms)",
-            results_dir,
+            results_root,
         )
-    RESULTS_DIR = results_dir
+
+    migrate_legacy_flat_results(results_root)
+    run_dir = make_run_dir(results_root)
+    point_latest_symlink(results_root, run_dir)
+
+    RESULTS_ROOT = results_root
+    RESULTS_DIR = run_dir
     output = str(RESULTS_DIR / "mapping_comparison.json")
     mappings_csv = str(RESULTS_DIR / "all_index_mappings.csv")
     readiness_csv = str(RESULTS_DIR / "central_format_readiness.csv")
@@ -2024,6 +2134,7 @@ def main(
     MAPPINGS_YAML_FILE = mappings_yaml
     MAPPINGS_YAML_DIR = mappings_yaml_dir
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("Writing this run to %s", RESULTS_DIR)
 
     config = config or {}
     shared_verify = config.get("verify_certs")
