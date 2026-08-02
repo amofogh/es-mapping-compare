@@ -126,6 +126,22 @@ st.markdown(
         font-weight: 600;
     }
 
+    /* Session-state tab bar (st.radio horizontal) */
+    div[data-testid="stRadio"] > div {
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        border-bottom: 1px solid #334155;
+        padding-bottom: 0.45rem;
+        margin-bottom: 0.65rem;
+    }
+    div[data-testid="stRadio"] label {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 8px 8px 0 0;
+        padding: 0.4rem 0.75rem !important;
+        font-weight: 600;
+    }
+
     .stAlert { border-radius: 10px; }
 
     /* Sleek dashboard status bar — two scannable metric rows */
@@ -1151,36 +1167,41 @@ if index_hits == 0:
     st.stop()
 elif wrong_day_count:
     st.warning(
-        f"⚠️ Some resolved indexes do not contain `{day_suffix}` "
-        f"(wrong-day: {wrong_day_count})."
+        f"⚠️ **{wrong_day_count}** microservices emitted no logs on "
+        f"**{selected_day}** (showing last known index mappings)."
     )
+    if st.button(
+        "🔍 Triage Mismatched Services",
+        key="triage_mismatched_services_btn",
+        type="primary",
+    ):
+        st.session_state["main_dashboard_tab"] = "⚠️ Conflicts"
 
-(
-    tab_readiness,
-    tab_inventory,
-    tab_schema,
-    tab_ecs,
-    tab_fields,
-    tab_conflicts,
-    tab_compare,
-    tab_info,
-) = st.tabs(
-    [
-        "🚀 Readiness",
-        "📦 Inventory",
-        "🗂️ Schema",
-        "✅ ECS Checklist",
-        "📋 Fields",
-        "⚠️ Conflicts",
-        "📉 Compare days",
-        "ℹ️ Info",
-    ]
+MAIN_TAB_OPTIONS = [
+    "🚀 Readiness",
+    "📦 Inventory",
+    "🗂️ Schema",
+    "✅ ECS Checklist",
+    "📋 Fields",
+    "⚠️ Conflicts",
+    "📉 Compare days",
+    "ℹ️ Info",
+]
+if "main_dashboard_tab" not in st.session_state:
+    st.session_state["main_dashboard_tab"] = MAIN_TAB_OPTIONS[0]
+
+selected_tab = st.radio(
+    "Dashboard section",
+    MAIN_TAB_OPTIONS,
+    key="main_dashboard_tab",
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
 # ---------------------------------------------------------------------------
 # Tab — Readiness
 # ---------------------------------------------------------------------------
-with tab_readiness:
+if selected_tab == "🚀 Readiness":
     kpi_cols = st.columns(5, gap="small")
     with kpi_cols[0]:
         st.metric("Total Projects", kpis["total_projects"])
@@ -1262,7 +1283,7 @@ with tab_readiness:
 # ---------------------------------------------------------------------------
 # Tab — Inventory
 # ---------------------------------------------------------------------------
-with tab_inventory:
+elif selected_tab == "📦 Inventory":
     if field_counts_df is None or field_counts_df.empty:
         st.warning(
             "`index_field_counts.csv` is missing for this run. "
@@ -1309,7 +1330,7 @@ with tab_inventory:
 # ---------------------------------------------------------------------------
 # Tab — Schema
 # ---------------------------------------------------------------------------
-with tab_schema:
+elif selected_tab == "🗂️ Schema":
     prefixes = sorted(prefix_index.keys()) or sorted(
         readiness_df["project_prefix"].dropna().astype(str).unique()
     )
@@ -1414,7 +1435,7 @@ with tab_schema:
 # ---------------------------------------------------------------------------
 # Tab — ECS Checklist
 # ---------------------------------------------------------------------------
-with tab_ecs:
+elif selected_tab == "✅ ECS Checklist":
     ecs_matrix = _ecs_matrix_df(comparison_data)
     ready_n = int(ecs_matrix["ecs_ready"].sum()) if not ecs_matrix.empty else 0
     total_n = len(ecs_matrix)
@@ -1516,7 +1537,7 @@ with tab_ecs:
 # ---------------------------------------------------------------------------
 # Tab — Fields
 # ---------------------------------------------------------------------------
-with tab_fields:
+elif selected_tab == "📋 Fields":
     st.markdown("##### All mapped fields")
     st.caption(
         "Full `all_index_mappings.csv` inventory — filter by project or ECS standard."
@@ -1569,7 +1590,7 @@ with tab_fields:
 # ---------------------------------------------------------------------------
 # Tab — Conflicts (schema / ECS issues)
 # ---------------------------------------------------------------------------
-with tab_conflicts:
+elif selected_tab == "⚠️ Conflicts":
     ecs_gap_rows = []
     missing_index_rows = []
     wrong_day_rows = []
@@ -1597,10 +1618,6 @@ with tab_conflicts:
                         "project_prefix": prefix,
                         "resolved_index": idx_name,
                         "status": entry.get("status"),
-                        "issue_description": (
-                            f"No logs ingested on {selected_day}; "
-                            "falling back to latest available index."
-                        ),
                     }
                 )
             if missing_ecs or not ecs_info.get("ecs_ready", False):
@@ -1628,16 +1645,58 @@ with tab_conflicts:
 
     non_ecs_fields = mappings_df[~mappings_df["is_ecs_standard"]].copy()
 
+    kpi_c1, kpi_c2, kpi_c3, kpi_c4 = st.columns(4, gap="small")
+    with kpi_c1:
+        st.metric(
+            "🔴 Core ECS Violations",
+            f"{len(ecs_gaps_df):,}",
+            help="Missing baseline ECS field rows",
+        )
+    with kpi_c2:
+        st.metric(
+            "🟡 Stale Indices",
+            f"{len(wrong_day_df):,}",
+            help="Date mismatches vs selected index day",
+        )
+    with kpi_c3:
+        st.metric(
+            "🟠 Offline Services",
+            f"{len(missing_index_df):,}",
+            help="Services with no resolved index",
+        )
+    with kpi_c4:
+        st.metric(
+            "⚪ Non-Standard Fields",
+            f"{len(non_ecs_fields):,}",
+            help="Custom / non-ECS mapped fields",
+        )
+
     st.markdown(
-        f'<div class="conflict-banner">'
-        f"⚠️ Elasticsearch Schema Issues: "
-        f"<strong>{len(ecs_gaps_df):,}</strong> missing required ECS field rows · "
-        f"<strong>{len(missing_index_df):,}</strong> services without index · "
-        f"<strong>{len(wrong_day_df):,}</strong> date-mismatched indices · "
-        f"<strong>{len(non_ecs_fields):,}</strong> non-ECS field mappings"
-        f"</div>",
-        unsafe_allow_html=True,
+        f"##### 🟡 Date Mismatched Indices ({len(wrong_day_df)})"
     )
+    if wrong_day_df.empty:
+        st.caption("All active indices match the selected index day.")
+    else:
+        st.dataframe(
+            wrong_day_df[
+                ["project_prefix", "resolved_index", "status"]
+            ],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "project_prefix": st.column_config.TextColumn(
+                    "Service", width="medium"
+                ),
+                "resolved_index": st.column_config.TextColumn(
+                    "Active Index Name", width="large"
+                ),
+                "status": st.column_config.TextColumn("Status", width="small"),
+            },
+        )
+        st.info(
+            f"💡 Service generated no logs on **{selected_day}**. "
+            "Analyzer fell back to the latest active index."
+        )
 
     st.markdown("##### Missing required ECS fields")
     if ecs_gaps_df.empty:
@@ -1650,31 +1709,6 @@ with tab_conflicts:
         st.caption("None for this filter/day.")
     else:
         st.dataframe(missing_index_df, width="stretch", hide_index=True)
-
-    st.subheader(
-        "Services with Stale / Date Mismatched Indices",
-        anchor="date-mismatch",
-    )
-    if wrong_day_df.empty:
-        st.caption("All active indices match the selected index day.")
-    else:
-        st.dataframe(
-            wrong_day_df,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "project_prefix": st.column_config.TextColumn(
-                    "Project", width="medium"
-                ),
-                "resolved_index": st.column_config.TextColumn(
-                    "Resolved Index", width="large"
-                ),
-                "status": st.column_config.TextColumn("Status", width="small"),
-                "issue_description": st.column_config.TextColumn(
-                    "Issue", width="large"
-                ),
-            },
-        )
 
     st.markdown("##### Non-ECS field inventory")
     st.caption(
@@ -1719,7 +1753,7 @@ with tab_conflicts:
 # ---------------------------------------------------------------------------
 # Tab — Compare days
 # ---------------------------------------------------------------------------
-with tab_compare:
+elif selected_tab == "📉 Compare days":
     if baseline_day == "(none)":
         st.info(
             "Select a **baseline day** in the header to diff against the active index day. "
@@ -1836,7 +1870,7 @@ with tab_compare:
 # ---------------------------------------------------------------------------
 # Tab — Info & Guide
 # ---------------------------------------------------------------------------
-with tab_info:
+elif selected_tab == "ℹ️ Info":
     st.markdown(
         """
         <div class="efk-info-card">
