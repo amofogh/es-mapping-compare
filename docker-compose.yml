@@ -53,6 +53,7 @@ services:
       STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
       STREAMLIT_BROWSER_GATHERUSAGESTATS: "false"
       STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_CLIENT_TOOLBAR_MODE: "viewer"
       ES_VERIFY_CERTS: ${ES_VERIFY_CERTS:-false}
       PREFIX_FILTER: ${PREFIX_FILTER:-}
     volumes:
@@ -61,3 +62,4 @@ services:
       - ./.env:/app/.env:ro
       - ./app.py:/app/app.py:ro
       - ./compare_es_mappings.py:/app/compare_es_mappings.py:ro
+      - ./.streamlit:/app/.streamlit:ro

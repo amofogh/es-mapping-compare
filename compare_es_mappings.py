@@ -1391,7 +1391,8 @@ def export_central_format_readiness_csv(
         "project_prefix",
         "core_team",
         "total_fields",
-        "ecs_compliant_fields_count",
+        "ecs_core_score",
+        "ecs_total_fields",
         "missing_ecs_fields_count",
         "can_centralize_as_is",
         "target_log_format",
@@ -1407,7 +1408,10 @@ def export_central_format_readiness_csv(
         ecs_info = normalize_ecs(entry.get("ecs"))
         issues = entry.get("issues") or field_issues(fields, ecs_info=ecs_info)
         missing_ecs = issues.get("missing_ecs_fields") or []
-        ecs_compliant = sum(1 for f in fields if is_ecs_standard_field(f))
+        # Core score: how many of the 5 required ECS fields are present as ECS paths.
+        ecs_core_score = int((ecs_info or {}).get("ecs_fields_present") or 0)
+        # Total count of any mapped field that matches ECS standard paths/namespaces.
+        ecs_total_fields = sum(1 for f in fields if is_ecs_standard_field(f))
 
         target_log_format = classify_log_format_archetype(
             fields, ecs_info=ecs_info or None
@@ -1423,7 +1427,8 @@ def export_central_format_readiness_csv(
                 "project_prefix": prefix,
                 "core_team": core_team_of(prefix),
                 "total_fields": len(fields),
-                "ecs_compliant_fields_count": ecs_compliant,
+                "ecs_core_score": ecs_core_score,
+                "ecs_total_fields": ecs_total_fields,
                 "missing_ecs_fields_count": len(missing_ecs),
                 "can_centralize_as_is": _bool_csv(can_centralize),
                 "target_log_format": target_log_format,

@@ -1,11 +1,11 @@
-"""EFK Migration & Schema Analyzer — Streamlit dashboard."""
+"""EFKSchema Analyzer — Streamlit dashboard."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
-from datetime import date as date_cls
+from datetime import date as date_cls, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ import streamlit as st
 import yaml
 
 from compare_es_mappings import (
+    ECS_FIELDS,
     build_es_client,
     entry_fields,
     entry_index_name,
@@ -39,13 +40,21 @@ _LEGACY_CSV_COLUMNS = {
     "total_fields_stage": "total_fields",
     "stage_resolved_index": "resolved_index",
     "stage_data_type": "data_type",
+    # Old readiness used one overloaded count for the 0–5 progress bar.
+    "ecs_compliant_fields_count": "ecs_total_fields",
 }
 
 st.set_page_config(
-    page_title="EFK Migration & Schema Analyzer",
+    page_title="EFK Schema Analyzer",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# Disable Streamlit "C" = Clear cache (conflicts with copy / Ctrl+C workflows).
+try:
+    st.set_option("client.toolbarMode", "viewer")
+except Exception:  # noqa: BLE001
+    pass
 
 st.markdown(
     """
@@ -119,8 +128,11 @@ st.markdown(
 
     .stAlert { border-radius: 10px; }
 
-    /* Sleek dashboard status bar */
+    /* Sleek dashboard status bar — two scannable metric rows */
     .efk-status-bar {
+        display: flex;
+        flex-direction: column;
+        gap: 0.45rem;
         background: #0f172a;
         border: 1px solid #1e293b;
         color: #cbd5e1;
@@ -128,13 +140,41 @@ st.markdown(
         padding: 0.75rem 1rem;
         margin: 0.35rem 0 0.85rem 0;
         font-size: 0.92rem;
-        line-height: 1.45;
+        line-height: 1.5;
+    }
+    .efk-status-bar .efk-status-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.3rem 0.65rem;
+    }
+    .efk-status-bar .efk-status-sep {
+        color: #475569;
+        user-select: none;
     }
     .efk-status-bar code {
         color: #e2e8f0;
         background: #1e293b;
         padding: 0.1rem 0.35rem;
         border-radius: 4px;
+    }
+
+    /* Days-found caption block */
+    .efk-days-found {
+        color: #94a3b8;
+        font-size: 0.88rem;
+        line-height: 1.55;
+        margin: 0.15rem 0 0.55rem 0;
+    }
+    .efk-days-found div + div {
+        margin-top: 0.2rem;
+    }
+    .efk-days-found code {
+        color: #cbd5e1;
+        background: #1e293b;
+        padding: 0.05rem 0.3rem;
+        border-radius: 4px;
+        font-size: 0.84rem;
     }
 
     div[data-testid="stExpander"] {
@@ -151,6 +191,35 @@ st.markdown(
         font-weight: 600;
         margin-bottom: 0.75rem;
         border: 1px solid #fca5a5;
+    }
+
+    .efk-info-card {
+        background: linear-gradient(145deg, #0f172a 0%, #1e293b 100%);
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 1.15rem 1.35rem;
+        margin: 0.35rem 0 1.1rem 0;
+        color: #e2e8f0;
+        line-height: 1.55;
+    }
+    .efk-info-card h3 {
+        margin: 0 0 0.75rem 0;
+        color: #f8fafc;
+        font-size: 1.15rem;
+    }
+    .efk-info-card dl {
+        margin: 0;
+        display: grid;
+        grid-template-columns: minmax(140px, 200px) 1fr;
+        gap: 0.45rem 1rem;
+    }
+    .efk-info-card dt {
+        color: #94a3b8;
+        font-weight: 600;
+    }
+    .efk-info-card dd {
+        margin: 0;
+        color: #f1f5f9;
     }
 
     /* Align action-row primary button height */
@@ -211,9 +280,11 @@ def _folder_has_indices_for_day(run_dir: Path, day: str) -> bool:
 
 
 def _normalize_csv_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename legacy stage_* CSV columns to current names when present."""
+    """Rename legacy stage_* / ecs CSV columns to current names when present."""
     rename = {
-        old: new for old, new in _LEGACY_CSV_COLUMNS.items() if old in df.columns
+        old: new
+        for old, new in _LEGACY_CSV_COLUMNS.items()
+        if old in df.columns and new not in df.columns
     }
     if rename:
         df = df.rename(columns=rename)
@@ -317,6 +388,45 @@ def fetch_index_day(
         else:
             os.environ["PREFIX_FILTER"] = prev
     return code, buf.getvalue()[-4000:]
+
+
+def _recent_index_days(es_days: list[str], n: int = 3) -> list[str]:
+    """Newest ``n`` days from ES listing, else last ``n`` calendar days."""
+    if es_days:
+        return list(es_days[:n])
+    today = date_cls.today()
+    return [(today - timedelta(days=i)).isoformat() for i in range(n)]
+
+
+def _ensure_days_cached(
+    days: list[str],
+    *,
+    cached: dict[str, str],
+    prefix_filter: str = "",
+    attempted: set[str] | None = None,
+) -> tuple[dict[str, str], list[tuple[str, int, str]]]:
+    """
+    Fetch any of ``days`` that are missing from ``cached``.
+
+    Skips days already in ``attempted`` (failed previously this session).
+    Returns updated cache map and list of (day, exit_code, log_tail) for fetches.
+    """
+    attempted = attempted if attempted is not None else set()
+    results: list[tuple[str, int, str]] = []
+    updated = dict(cached)
+
+    for day in days:
+        if not day or day in updated or day in attempted:
+            continue
+        code, log_tail = fetch_index_day(day, prefix_filter=prefix_filter)
+        results.append((day, code, log_tail))
+        attempted.add(day)
+        discover_days.clear()
+        load_data.clear()
+        list_es_index_days.clear()
+        updated = discover_days(str(RESULTS_ROOT))
+
+    return updated, results
 
 
 @st.cache_data(show_spinner=False)
@@ -437,6 +547,19 @@ def load_data(
     with comparison_json.open(encoding="utf-8") as fh:
         comparison = json.load(fh)
 
+    # Backfill ecs_core_score from the JSON report when older CSVs lack it.
+    if "ecs_core_score" not in readiness.columns and "project_prefix" in readiness.columns:
+        score_by_prefix: dict[str, int] = {}
+        for entry in comparison.get("results") or []:
+            prefix = str(entry.get("prefix") or "")
+            ecs_info = normalize_ecs(entry.get("ecs"))
+            score_by_prefix[prefix] = int(ecs_info.get("ecs_fields_present") or 0)
+        readiness["ecs_core_score"] = (
+            readiness["project_prefix"].astype(str).map(score_by_prefix).fillna(0).astype(int)
+        )
+    if "ecs_total_fields" not in readiness.columns and "ecs_compliant_fields_count" in readiness.columns:
+        readiness["ecs_total_fields"] = readiness["ecs_compliant_fields_count"]
+
     field_counts = None
     if field_counts_csv.is_file():
         field_counts = _normalize_csv_columns(pd.read_csv(field_counts_csv))
@@ -496,6 +619,90 @@ def _ecs_checklist_df(ecs_side: dict[str, Any] | None) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+CORE_ECS_FIELD_NAMES = (
+    "@timestamp",
+    "log.level",
+    "message",
+    "service.name",
+    "host.name",
+)
+
+
+def _ecs_matrix_cell(detail: dict[str, Any]) -> str:
+    """
+    Render one core-ECS matrix cell.
+
+    - ecs     → ✅ ecs
+    - legacy  → ⚠️ <actual emitted field name(s) from the index mapping>
+    - missing → ❌ missing
+    """
+    status = (detail or {}).get("status") or "missing"
+    if status == "ecs":
+        return "✅ ecs"
+    if status == "missing":
+        return "❌ missing"
+
+    legacy = list((detail or {}).get("legacy_alternatives_found") or [])
+    if legacy:
+        return "⚠️ " + ", ".join(str(name) for name in legacy)
+    return "⚠️ legacy"
+
+
+def _ecs_matrix_df(comparison: dict[str, Any]) -> pd.DataFrame:
+    """One row per project: status of each core ECS field (with emitted names)."""
+    rows = []
+    for entry in comparison.get("results") or []:
+        ecs_info = normalize_ecs(entry.get("ecs"))
+        details = (ecs_info.get("fields") or {}) if ecs_info else {}
+        mapped_fields = entry_fields(entry)
+        row: dict[str, Any] = {
+            "project_prefix": entry.get("prefix"),
+            "index_name": entry_index_name(entry) or "",
+            "ecs_ready": bool(ecs_info.get("ecs_ready")),
+            "ecs_score": (
+                f"{ecs_info.get('ecs_fields_present', 0)}/"
+                f"{ecs_info.get('ecs_fields_total', 5)}"
+                if ecs_info
+                else "0/5"
+            ),
+        }
+        for field in CORE_ECS_FIELD_NAMES:
+            detail = details.get(field) or {}
+            # Recover emitted names from the mapping when not stored on the report.
+            if (
+                detail.get("status") == "legacy"
+                and not detail.get("legacy_alternatives_found")
+                and mapped_fields
+            ):
+                found = [a for a in (ECS_FIELDS.get(field) or []) if a in mapped_fields]
+                if found:
+                    detail = {**detail, "legacy_alternatives_found": found}
+            row[field] = _ecs_matrix_cell(detail)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _schema_issue_reason(entry: dict[str, Any]) -> str:
+    """Human-readable reason a project is flagged (or clean)."""
+    idx = entry_index_name(entry)
+    status = str(entry.get("status") or "")
+    if (
+        not idx
+        or idx in ("MISSING", "DISABLED")
+        or status in {"missing_index", "missing_stage"}
+    ):
+        return "No index found on Elasticsearch"
+
+    ecs_info = normalize_ecs(entry.get("ecs"))
+    issues = entry.get("issues") or {}
+    missing = list(issues.get("missing_ecs_fields") or [])
+    if missing:
+        return "Missing core ECS: " + ", ".join(missing)
+    if not ecs_info.get("ecs_ready", False):
+        return "Core ECS score < 5"
+    return "Clean (Compliant)"
+
+
 def _project_status_table(comparison: dict[str, Any]) -> pd.DataFrame:
     rows = []
     for entry in comparison.get("results") or []:
@@ -508,11 +715,7 @@ def _project_status_table(comparison: dict[str, Any]) -> pd.DataFrame:
                 "error": entry.get("error") or "",
                 "index_name": entry_index_name(entry) or "",
                 "has_schema_drift": bool(entry.get("has_schema_drift")),
-                "has_ecs_gaps": bool(
-                    entry.get("has_ecs_gaps")
-                    or issues.get("missing_ecs_fields")
-                    or not ecs_info.get("ecs_ready", False)
-                ),
+                "schema_issue_reason": _schema_issue_reason(entry),
                 "ecs_ready": bool(ecs_info.get("ecs_ready")),
                 "ecs_score": (
                     f"{ecs_info.get('ecs_fields_present', 0)}/"
@@ -533,21 +736,20 @@ def _kpi(readiness: pd.DataFrame, comparison: dict[str, Any]) -> dict[str, int]:
         if "missing_ecs_fields_count" in readiness.columns
         else None
     )
+    core_col = None
+    if "ecs_core_score" in readiness.columns:
+        core_col = pd.to_numeric(readiness["ecs_core_score"], errors="coerce")
     return {
         "total_projects": int(
             comparison.get("prefixes_total") or len(readiness)
         ),
-        "ecs_ready": int((readiness["ecs_compliant_fields_count"] >= 5).sum())
-        if "ecs_compliant_fields_count" in readiness.columns
+        "ecs_ready": int((core_col >= 5).sum())
+        if core_col is not None
         else int(comparison.get("prefixes_total", 0))
         - int(comparison.get("prefixes_not_ecs_ready") or 0),
         "not_ecs_ready": int(
             comparison.get("prefixes_not_ecs_ready")
-            or (
-                (readiness["ecs_compliant_fields_count"] < 5).sum()
-                if "ecs_compliant_fields_count" in readiness.columns
-                else 0
-            )
+            or ((core_col < 5).sum() if core_col is not None else 0)
         ),
         "legacy_workers": int(
             readiness["target_log_format"]
@@ -659,17 +861,23 @@ def _render_list_table(title: str, items: list[Any], empty: str) -> None:
 # ---------------------------------------------------------------------------
 # Bootstrap — pick an index day, fetch from ES if needed
 # ---------------------------------------------------------------------------
+if "fetch_attempted_days" not in st.session_state:
+    st.session_state.fetch_attempted_days = set()
+
 cached_days = discover_days(str(RESULTS_ROOT))
 es_days = list_es_index_days()
 all_day_options = sorted(set(cached_days) | set(es_days), reverse=True)
+recent_days = _recent_index_days(es_days, n=3)
 
 default_day = date_cls.today()
-if cached_days:
+if recent_days:
+    default_day = date_cls.fromisoformat(recent_days[0])
+elif cached_days:
     default_day = date_cls.fromisoformat(next(iter(cached_days)))
 elif es_days:
     default_day = date_cls.fromisoformat(es_days[0])
 
-st.title("🔎 EFK Migration & Schema Analyzer")
+st.title("🔎 EFK Schema Analyzer")
 
 team_options = ["All"] + load_team_options()
 
@@ -684,10 +892,24 @@ with col1:
     selected_day = selected_day_date.isoformat()
 with col2:
     baseline_options = ["(none)"] + [d for d in all_day_options if d != selected_day]
+    if "baseline_day_select" not in st.session_state:
+        preferred = next(
+            (
+                d
+                for d in recent_days
+                if d != selected_day and d in baseline_options
+            ),
+            "(none)",
+        )
+        st.session_state.baseline_day_select = preferred
+    # Drop stale selection if options changed (e.g. same as index day).
+    if st.session_state.baseline_day_select not in baseline_options:
+        st.session_state.baseline_day_select = "(none)"
     baseline_day = st.selectbox(
         "Compare against day",
         options=baseline_options,
-        index=0,
+        key="baseline_day_select",
+        help="Auto-fetches this day from Elasticsearch when not cached.",
     )
 with col3:
     project_filter = st.selectbox(
@@ -698,6 +920,8 @@ with col3:
         "Pick a team (e.g. mic, ams) to limit view and Fetch.",
     )
 
+prefix_filter_arg = "" if project_filter == "All" else project_filter
+
 fetch_clicked = st.button(
     "⬇ Fetch from Elasticsearch",
     type="primary",
@@ -707,10 +931,16 @@ fetch_clicked = st.button(
 )
 
 if es_days:
-    st.caption(
-        "Days found on Elasticsearch: "
-        + ", ".join(f"`{d}`" for d in es_days[:14])
-        + (" …" if len(es_days) > 14 else "")
+    days_list = ", ".join(f"<code>{d}</code>" for d in es_days[:14])
+    if len(es_days) > 14:
+        days_list += " …"
+    recent_list = ", ".join(f"<code>{d}</code>" for d in recent_days)
+    st.markdown(
+        f'<div class="efk-days-found">'
+        f"<div>📅 Days found on Elasticsearch: {days_list}</div>"
+        f"<div>⚡ Auto-fetch last {len(recent_days)}: {recent_list}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
     )
 else:
     st.caption(
@@ -718,6 +948,7 @@ else:
         "You can still pick a day and fetch."
     )
 
+# Manual fetch for the selected index day
 if fetch_clicked:
     with st.spinner(f"Fetching mappings for index day {selected_day}…"):
         discover_days.clear()
@@ -725,8 +956,9 @@ if fetch_clicked:
         list_es_index_days.clear()
         code, log_tail = fetch_index_day(
             selected_day,
-            prefix_filter="" if project_filter == "All" else project_filter,
+            prefix_filter=prefix_filter_arg,
         )
+        st.session_state.fetch_attempted_days.add(selected_day)
     if code in (0, 2):
         st.success(
             f"Loaded index day `{selected_day}` "
@@ -747,6 +979,91 @@ if fetch_clicked:
         discover_days.clear()
         cached_days = discover_days(str(RESULTS_ROOT))
         st.stop()
+
+# Startup: auto-resolve the last 3 index days when missing from cache
+missing_recent = [
+    d
+    for d in recent_days
+    if d not in cached_days and d not in st.session_state.fetch_attempted_days
+]
+if missing_recent:
+    with st.spinner(
+        f"Auto-fetching last {len(recent_days)} days from Elasticsearch: "
+        + ", ".join(missing_recent)
+        + "…"
+    ):
+        cached_days, fetch_results = _ensure_days_cached(
+            missing_recent,
+            cached=cached_days,
+            prefix_filter=prefix_filter_arg,
+            attempted=st.session_state.fetch_attempted_days,
+        )
+    ok = [d for d, code, _ in fetch_results if code in (0, 2)]
+    bad = [(d, code) for d, code, _ in fetch_results if code not in (0, 2)]
+    if ok:
+        st.success("Auto-fetched: " + ", ".join(f"`{d}`" for d in ok))
+    if bad:
+        st.warning(
+            "Could not auto-fetch: "
+            + ", ".join(f"`{d}` (exit {c})" for d, c in bad)
+        )
+    if fetch_results:
+        st.rerun()
+
+# Auto-fetch selected index day if still missing
+if (
+    selected_day not in cached_days
+    and selected_day not in st.session_state.fetch_attempted_days
+):
+    with st.spinner(f"Auto-fetching index day `{selected_day}`…"):
+        cached_days, fetch_results = _ensure_days_cached(
+            [selected_day],
+            cached=cached_days,
+            prefix_filter=prefix_filter_arg,
+            attempted=st.session_state.fetch_attempted_days,
+        )
+    if fetch_results:
+        day, code, log_tail = fetch_results[0]
+        if code in (0, 2):
+            st.success(f"Auto-fetched `{day}` (exit {code}).")
+            st.rerun()
+        else:
+            st.error(
+                f"Auto-fetch failed for `{day}` (exit {code}). "
+                "No daily indices for that day on Elasticsearch."
+            )
+            if log_tail.strip():
+                st.code(log_tail)
+
+# Auto-fetch compare-against (baseline) day when selected and missing
+if (
+    baseline_day != "(none)"
+    and baseline_day not in cached_days
+    and baseline_day not in st.session_state.fetch_attempted_days
+):
+    with st.spinner(f"Auto-fetching compare-against day `{baseline_day}`…"):
+        cached_days, fetch_results = _ensure_days_cached(
+            [baseline_day],
+            cached=cached_days,
+            prefix_filter=prefix_filter_arg,
+            attempted=st.session_state.fetch_attempted_days,
+        )
+    if fetch_results:
+        day, code, log_tail = fetch_results[0]
+        if code in (0, 2):
+            st.success(f"Auto-fetched compare day `{day}` (exit {code}).")
+            st.rerun()
+        else:
+            st.warning(
+                f"Could not fetch compare day `{day}` (exit {code}). "
+                "Pick another day or check Elasticsearch."
+            )
+            if log_tail.strip():
+                with st.expander("Fetch log", expanded=False):
+                    st.code(log_tail)
+
+# Refresh option lists after any auto-fetch path
+all_day_options = sorted(set(cached_days) | set(es_days), reverse=True)
 
 selected_run = cached_days.get(selected_day)
 if not selected_run:
@@ -800,12 +1117,20 @@ for entry in comparison_data.get("results") or []:
 
 st.markdown(
     f'<div class="efk-status-bar">'
-    f"Index day: <code>{comparison_data.get('index_date', selected_day)}</code> · "
-    f"Folder: <code>{selected_run}</code> · "
-    f"Filter: <code>{project_filter}</code> · "
-    f"Generated: <code>{comparison_data.get('generated_at', '—')}</code> · "
-    f"Mode: <code>{comparison_data.get('mode', 'cluster')}</code> · "
+    f'<div class="efk-status-row">'
+    f"Index day: <code>{comparison_data.get('index_date', selected_day)}</code>"
+    f'<span class="efk-status-sep">|</span>'
+    f"Folder: <code>{selected_run}</code>"
+    f'<span class="efk-status-sep">|</span>'
+    f"Mode: <code>{comparison_data.get('mode', 'cluster')}</code>"
+    f"</div>"
+    f'<div class="efk-status-row">'
+    f"Filter: <code>{project_filter}</code>"
+    f'<span class="efk-status-sep">|</span>'
     f"Indexes: <strong>{index_hits}</strong>"
+    f'<span class="efk-status-sep">|</span>'
+    f"Generated: <code>{comparison_data.get('generated_at', '—')}</code>"
+    f"</div>"
     f"</div>",
     unsafe_allow_html=True,
 )
@@ -826,7 +1151,7 @@ if index_hits == 0:
     st.stop()
 elif wrong_day_count:
     st.warning(
-        f"Some resolved indexes do not contain `{day_suffix}` "
+        f"⚠️ Some resolved indexes do not contain `{day_suffix}` "
         f"(wrong-day: {wrong_day_count})."
     )
 
@@ -834,17 +1159,21 @@ elif wrong_day_count:
     tab_readiness,
     tab_inventory,
     tab_schema,
+    tab_ecs,
     tab_fields,
     tab_conflicts,
     tab_compare,
+    tab_info,
 ) = st.tabs(
     [
         "🚀 Readiness",
         "📦 Inventory",
         "🗂️ Schema",
+        "✅ ECS Checklist",
         "📋 Fields",
         "⚠️ Conflicts",
         "📉 Compare days",
+        "ℹ️ Info",
     ]
 )
 
@@ -852,7 +1181,7 @@ elif wrong_day_count:
 # Tab — Readiness
 # ---------------------------------------------------------------------------
 with tab_readiness:
-    kpi_cols = st.columns(6, gap="small")
+    kpi_cols = st.columns(5, gap="small")
     with kpi_cols[0]:
         st.metric("Total Projects", kpis["total_projects"])
     with kpi_cols[1]:
@@ -863,12 +1192,6 @@ with tab_readiness:
         st.metric("Legacy Workers (F3)", kpis["legacy_workers"])
     with kpi_cols[4]:
         st.metric("Schema Issues", kpis["schema_drift"])
-    with kpi_cols[5]:
-        st.metric(
-            "ECS Gap Projects",
-            kpis["ecs_gap_projects"],
-            help=f"{kpis['missing_ecs_fields']} missing required ECS fields total",
-        )
 
     st.markdown("##### Central format readiness")
     st.dataframe(
@@ -883,17 +1206,20 @@ with tab_readiness:
             "target_log_format": st.column_config.TextColumn(
                 "Target Log Format", width="large"
             ),
-            "ecs_compliant_fields_count": st.column_config.ProgressColumn(
-                "ECS Fields (0–5)",
+            "ecs_core_score": st.column_config.ProgressColumn(
+                "ECS Core (0–5)",
                 min_value=0,
                 max_value=5,
                 format="%d",
+            ),
+            "ecs_total_fields": st.column_config.NumberColumn(
+                "ECS Total Fields", format="%d"
             ),
             "can_centralize_as_is": st.column_config.CheckboxColumn(
                 "Can Centralize As-Is", width="small"
             ),
             "missing_ecs_fields_count": st.column_config.NumberColumn(
-                "Missing ECS", format="%d"
+                "Missing ECS Core", format="%d"
             ),
             "total_fields": st.column_config.NumberColumn("Fields", format="%d"),
             "docs_count": st.column_config.NumberColumn("Docs", format="%d"),
@@ -913,10 +1239,24 @@ with tab_readiness:
         hide_index=True,
         column_config={
             "has_schema_drift": st.column_config.CheckboxColumn("Schema Issues"),
-            "has_ecs_gaps": st.column_config.CheckboxColumn("ECS Gaps"),
+            "schema_issue_reason": st.column_config.TextColumn(
+                "Issue Reason", width="large"
+            ),
             "ecs_ready": st.column_config.CheckboxColumn("ECS Ready"),
             "error": st.column_config.TextColumn("Error", width="large"),
         },
+        column_order=[
+            "project_prefix",
+            "index_name",
+            "status",
+            "has_schema_drift",
+            "schema_issue_reason",
+            "ecs_ready",
+            "ecs_score",
+            "missing_ecs_fields",
+            "index_size",
+            "error",
+        ],
     )
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1412,108 @@ with tab_schema:
             st.code(_fields_to_yaml(mapped_fields), language="yaml")
 
 # ---------------------------------------------------------------------------
+# Tab — ECS Checklist
+# ---------------------------------------------------------------------------
+with tab_ecs:
+    ecs_matrix = _ecs_matrix_df(comparison_data)
+    ready_n = int(ecs_matrix["ecs_ready"].sum()) if not ecs_matrix.empty else 0
+    total_n = len(ecs_matrix)
+
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Projects", total_n)
+    e2.metric("ECS Ready", ready_n)
+    e3.metric("Not ECS Ready", total_n - ready_n)
+
+    st.markdown("##### Core ECS field matrix")
+    st.caption(
+        "Per-project status for the five required ECS fields. "
+        "`✅ ecs` = compliant · `⚠️ <emitted field>` = legacy alias found · "
+        "`❌ missing` = absent."
+    )
+
+    readiness_filter = st.selectbox(
+        "ECS readiness",
+        options=["All", "Ready only", "Not ready only"],
+        index=0,
+        key="ecs_tab_ready_filter",
+    )
+    matrix_view = ecs_matrix
+    if readiness_filter == "Ready only":
+        matrix_view = matrix_view[matrix_view["ecs_ready"]]
+    elif readiness_filter == "Not ready only":
+        matrix_view = matrix_view[~matrix_view["ecs_ready"]]
+
+    st.dataframe(
+        matrix_view,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "project_prefix": st.column_config.TextColumn("Project", width="medium"),
+            "index_name": st.column_config.TextColumn("Index", width="medium"),
+            "ecs_ready": st.column_config.CheckboxColumn("ECS Ready"),
+            "ecs_score": st.column_config.TextColumn("Score", width="small"),
+            "@timestamp": st.column_config.TextColumn("@timestamp"),
+            "log.level": st.column_config.TextColumn("log.level"),
+            "message": st.column_config.TextColumn("message"),
+            "service.name": st.column_config.TextColumn("service.name"),
+            "host.name": st.column_config.TextColumn("host.name"),
+        },
+    )
+
+    st.markdown("##### Per-project checklist")
+    ecs_prefixes = sorted(prefix_index.keys()) or sorted(
+        readiness_df["project_prefix"].dropna().astype(str).unique()
+    )
+    ecs_selected = st.selectbox(
+        "Choose a project prefix",
+        options=ecs_prefixes,
+        index=0 if ecs_prefixes else None,
+        placeholder="Select a service…",
+        key="ecs_checklist_prefix",
+    )
+    if not ecs_selected:
+        st.info("No project prefixes available in the loaded report.")
+    else:
+        ecs_entry = prefix_index.get(ecs_selected, {})
+        ecs_info = normalize_ecs(ecs_entry.get("ecs"))
+        issues = ecs_entry.get("issues") or {}
+        st.markdown(
+            f"**{ecs_selected}** — ready: `{bool(ecs_info.get('ecs_ready'))}` · "
+            f"score: "
+            f"`{ecs_info.get('ecs_fields_present', 0)}/"
+            f"{ecs_info.get('ecs_fields_total', 5)}`"
+        )
+        st.dataframe(
+            _ecs_checklist_df(ecs_info),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "present": st.column_config.CheckboxColumn("Present"),
+                "legacy_alternatives": st.column_config.TextColumn(
+                    "Legacy Alternatives", width="large"
+                ),
+            },
+        )
+        g1, g2 = st.columns(2)
+        with g1:
+            _render_list_table(
+                "Missing required ECS fields",
+                list(issues.get("missing_ecs_fields") or []),
+                "None — all core ECS fields present",
+            )
+        with g2:
+            legacy_rows = list(issues.get("legacy_ecs_alternatives") or [])
+            st.markdown(f"**Legacy ECS alternatives** ({len(legacy_rows)})")
+            if not legacy_rows:
+                st.caption("None")
+            else:
+                st.dataframe(
+                    pd.DataFrame(legacy_rows),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+# ---------------------------------------------------------------------------
 # Tab — Fields
 # ---------------------------------------------------------------------------
 with tab_fields:
@@ -1130,6 +1572,7 @@ with tab_fields:
 with tab_conflicts:
     ecs_gap_rows = []
     missing_index_rows = []
+    wrong_day_rows = []
     for entry in comparison_data.get("results") or []:
         prefix = entry.get("prefix")
         ecs_info = normalize_ecs(entry.get("ecs"))
@@ -1144,27 +1587,44 @@ with tab_conflicts:
                     "error": entry.get("error") or "",
                 }
             )
-        elif missing_ecs or not ecs_info.get("ecs_ready", False):
-            for field in missing_ecs or ["(not ecs_ready)"]:
-                detail = ((ecs_info.get("fields") or {}).get(field) or {})
-                ecs_gap_rows.append(
+        else:
+            if (
+                idx_name not in ("DISABLED", "MISSING")
+                and day_suffix not in str(idx_name)
+            ):
+                wrong_day_rows.append(
                     {
                         "project_prefix": prefix,
-                        "index_name": idx_name,
-                        "missing_ecs_field": field,
-                        "status": detail.get("status") or "missing",
-                        "legacy_alternatives": ", ".join(
-                            detail.get("legacy_alternatives_found") or []
-                        ),
-                        "ecs_score": (
-                            f"{ecs_info.get('ecs_fields_present', 0)}/"
-                            f"{ecs_info.get('ecs_fields_total', 5)}"
+                        "resolved_index": idx_name,
+                        "status": entry.get("status"),
+                        "issue_description": (
+                            f"No logs ingested on {selected_day}; "
+                            "falling back to latest available index."
                         ),
                     }
                 )
+            if missing_ecs or not ecs_info.get("ecs_ready", False):
+                for field in missing_ecs or ["(not ecs_ready)"]:
+                    detail = ((ecs_info.get("fields") or {}).get(field) or {})
+                    ecs_gap_rows.append(
+                        {
+                            "project_prefix": prefix,
+                            "index_name": idx_name,
+                            "missing_ecs_field": field,
+                            "status": detail.get("status") or "missing",
+                            "legacy_alternatives": ", ".join(
+                                detail.get("legacy_alternatives_found") or []
+                            ),
+                            "ecs_score": (
+                                f"{ecs_info.get('ecs_fields_present', 0)}/"
+                                f"{ecs_info.get('ecs_fields_total', 5)}"
+                            ),
+                        }
+                    )
 
     ecs_gaps_df = pd.DataFrame(ecs_gap_rows)
     missing_index_df = pd.DataFrame(missing_index_rows)
+    wrong_day_df = pd.DataFrame(wrong_day_rows)
 
     non_ecs_fields = mappings_df[~mappings_df["is_ecs_standard"]].copy()
 
@@ -1173,6 +1633,7 @@ with tab_conflicts:
         f"⚠️ Elasticsearch Schema Issues: "
         f"<strong>{len(ecs_gaps_df):,}</strong> missing required ECS field rows · "
         f"<strong>{len(missing_index_df):,}</strong> services without index · "
+        f"<strong>{len(wrong_day_df):,}</strong> date-mismatched indices · "
         f"<strong>{len(non_ecs_fields):,}</strong> non-ECS field mappings"
         f"</div>",
         unsafe_allow_html=True,
@@ -1189,6 +1650,31 @@ with tab_conflicts:
         st.caption("None for this filter/day.")
     else:
         st.dataframe(missing_index_df, width="stretch", hide_index=True)
+
+    st.subheader(
+        "Services with Stale / Date Mismatched Indices",
+        anchor="date-mismatch",
+    )
+    if wrong_day_df.empty:
+        st.caption("All active indices match the selected index day.")
+    else:
+        st.dataframe(
+            wrong_day_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "project_prefix": st.column_config.TextColumn(
+                    "Project", width="medium"
+                ),
+                "resolved_index": st.column_config.TextColumn(
+                    "Resolved Index", width="large"
+                ),
+                "status": st.column_config.TextColumn("Status", width="small"),
+                "issue_description": st.column_config.TextColumn(
+                    "Issue", width="large"
+                ),
+            },
+        )
 
     st.markdown("##### Non-ECS field inventory")
     st.caption(
@@ -1301,12 +1787,6 @@ with tab_compare:
             )
 
             diff_df = _diff_readiness(base_ready, readiness_df)
-            only_changes = st.checkbox(
-                "Show only added / removed / changed", value=True
-            )
-            view = (
-                diff_df[diff_df["change"] != "unchanged"] if only_changes else diff_df
-            )
 
             st.markdown("##### Per-project comparison")
             st.caption(
@@ -1314,7 +1794,7 @@ with tab_compare:
                 f"`{baseline_day}` vs `{selected_day}`."
             )
             st.dataframe(
-                view,
+                diff_df,
                 width="stretch",
                 hide_index=True,
                 column_config={
@@ -1352,3 +1832,174 @@ with tab_compare:
                     ),
                 },
             )
+
+# ---------------------------------------------------------------------------
+# Tab — Info & Guide
+# ---------------------------------------------------------------------------
+with tab_info:
+    st.markdown(
+        """
+        <div class="efk-info-card">
+          <h3>EFK Schema Migration &amp; Standardizer</h3>
+          <dl>
+            <dt>Author / Lead</dt>
+            <dd>Backend &amp; DevOps/SRE Engineer</dd>
+            <dt>Project</dt>
+            <dd>EFK Schema Migration &amp; Standardizer</dd>
+            <dt>Scope</dt>
+            <dd>~40+ microservices standardization on Elastic Common Schema (ECS)</dd>
+            <dt>Target architecture</dt>
+            <dd>Fluentd → Kafka → Elasticsearch (EFK pipeline)</dd>
+            <dt>Primary goal</dt>
+            <dd>Eliminate mapping drifts, type collisions, and unmapped dynamic
+                fields across daily indices</dd>
+          </dl>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### Log Format Archetypes")
+    st.caption(
+        "Each service is tagged into one of three Fluentd central-format targets "
+        "based on its Elasticsearch mapping and core ECS readiness."
+    )
+
+    st.markdown(
+        """
+#### Format 1 — ECS Native
+
+| | |
+|---|---|
+| **Definition** | Microservices emitting structured JSON logs that natively match the **5 core ECS fields** (`@timestamp`, `log.level`, `message`, `service.name`, `host.name`). |
+| **Fluentd handling** | Pass-through routing directly to Elasticsearch without heavy field transformation. |
+| **Action required** | None. Fully compliant. |
+
+#### Format 2 — Web API (Standard Mutate)
+
+| | |
+|---|---|
+| **Definition** | Web APIs emitting structured logs that cover core concepts under **legacy key names** (e.g. `level` instead of `log.level`, `msg` instead of `message`, `StatusCode` instead of `http.response.status_code`). |
+| **Fluentd handling** | Lightweight `record_transformer` / mutate filter to remap standard legacy keys into ECS paths. |
+| **Action required** | Apply the standard Fluentd remapping config template. |
+
+#### Format 3 — Legacy Worker (Heavy Mutate)
+
+| | |
+|---|---|
+| **Definition** | Background workers, legacy jobs, or unmapped services emitting unstructured text or sparse/nested custom payloads (`Properties.*`) missing baseline core concepts. |
+| **Fluentd handling** | Deep field unpacking, dynamic property extraction, or fallback label mapping (`labels.*`) to prevent Elasticsearch mapping collisions. |
+| **Action required** | Refactor the logger to output structured JSON, or apply heavy Fluentd parsing rules before centralizing. |
+        """
+    )
+
+    st.markdown("### Core 0–5 ECS Baseline vs Extended ECS Fields")
+    st.markdown(
+        """
+**Core ECS baseline (0–5)** — the five mandatory anchor fields required for
+basic cross-service filtering and readiness:
+
+1. `@timestamp`
+2. `log.level`
+3. `message`
+4. `service.name`
+5. `host.name`
+
+Legacy aliases (`level`, `msg`, `service`, `hostname`, …) are detected but
+**do not** raise the core score until remapped to the ECS paths above.
+Ready = **5/5**.
+
+**Extended ECS standard fields** — broader ECS paths and namespaces used to
+judge overall schema quality (examples: `trace.id`, `http.request.method`,
+`error.message`, `container.id`, `event.action`, `host.ip`). These feed
+**ECS Total Fields** in the Readiness table and do **not** change the 0–5
+core progress bar.
+        """
+    )
+
+    st.divider()
+    st.markdown("### 📚 System Documentation & Operations Manual")
+
+    st.markdown(
+        """
+#### 1. Executive Summary & Pipeline Architecture
+
+```text
+Microservices  →  Fluentd Collectors  →  Kafka Bus  →  Elasticsearch Cluster
+```
+
+This dashboard inventories daily Elasticsearch mappings, scores ECS readiness,
+and tags each service into a Fluentd central-format archetype so logs can be
+normalized before indexing.
+
+**Primary objectives**
+
+- Standardize **40+** microservice log schemas onto Elastic Common Schema (ECS)
+- Eliminate mapping collisions, type drifts, and unmapped dynamic fields
+- Collapse **40+** ad-hoc Fluentd configs into **3** core archetypes
+  (ECS Native · Web API Mutate · Legacy Worker Heavy Mutate)
+
+---
+
+#### 2. Core 0–5 ECS Score vs Extended ECS Fields
+
+**Core ECS baseline (0–5)** — mandatory anchor fields for readiness and
+cross-service filtering:
+
+| # | ECS path | Typical legacy aliases |
+|---|----------|------------------------|
+| 1 | `@timestamp` | `time`, `timestamp`, `date` |
+| 2 | `log.level` | `level`, `log_level`, `severity` |
+| 3 | `message` | `msg`, `log`, `log_message` |
+| 4 | `service.name` | `service`, `app`, `application` |
+| 5 | `host.name` | `hostname`, `host`, `host_name` |
+
+Legacy names are **detected** but do **not** raise the core score until remapped
+to the ECS paths. Ready = **5/5**. Shown as the **ECS Core (0–5)** progress bar.
+
+**Matrix cell status indicators** (✅ ECS Checklist — Core ECS Matrix):
+
+| Indicator | Meaning |
+|-----------|---------|
+| `✅ ecs` | The field natively uses the standard Elastic Common Schema path (e.g., `@timestamp`, `log.level`). |
+| `⚠️ <actual_emitted_field_name>` | A legacy field alias was detected in the index mapping (e.g., `⚠️ level` means the field mapped in Elasticsearch is literally named `level`). This is the exact key name to remap to its standard ECS counterpart in Fluentd. Multiple aliases are comma-joined (e.g., `⚠️ level, log_level`). |
+| `❌ missing` | The field is completely absent from the index mapping. |
+
+**Extended ECS standard fields** — broader ECS paths / namespaces
+(`http.*`, `trace.*`, `error.*`, `user.*`, `container.*`, `event.*`, …).
+These populate **ECS Total Fields** (e.g. 81) for schema-quality tracking and
+do **not** change the 0–5 progress bar.
+
+---
+
+#### 3. Glossary & Status Definitions
+
+| Term | Meaning |
+|------|---------|
+| **Can Centralize As-Is** | `TRUE` when a daily index exists, has valid mappings, and reaches **5/5** Core ECS score. |
+| **ECS Gap** | Any of the 5 core ECS baseline fields is missing (status ≠ `ecs`). |
+| **Schema Issues / Drift** | Index is missing **or** unresolved core ECS gaps remain. |
+| **Non-ECS Field** | Custom application field outside standard ECS namespaces — candidate for Fluentd `mutate` or `labels.*`. |
+| **Format 1 / 2 / 3** | Target Fluentd archetype (see Log Format Archetypes above). |
+| **Fields Δ / Docs Δ** | Day-over-day change in field count or document count (Compare days). |
+
+---
+
+#### 4. Dashboard Tabs Overview & Triage Guide
+
+| Tab | Purpose |
+|-----|---------|
+| **🚀 Readiness** | High-level KPIs and centralization readiness scores. |
+| **📦 Inventory** | Index names, document counts, total store sizes, and average log sizes. |
+| **🗂️ Schema** | Deep-dive field mapping inspection and YAML viewer. |
+| **✅ ECS Checklist** | Core 0–5 status matrix per service displaying exact emitted field names for legacy aliases (e.g. `✅ ecs`, `⚠️ level`, `❌ missing`). |
+| **📋 Fields** | Complete inventory of all mapped fields across the cluster. |
+| **⚠️ Conflicts** | Primary triage center for missing required ECS fields and unmapped custom fields. |
+| **📉 Compare days** | Day-over-day diff engine comparing schema metrics and doc counts. |
+| **ℹ️ Info** | Project metadata, archetype descriptions, and system documentation. |
+
+**Suggested triage flow:** Readiness KPIs → Conflicts (ECS gaps / non-ECS fields)
+→ ECS Checklist (per-field status) → Schema (YAML mapping) → Compare days
+(regression after a change).
+        """
+    )

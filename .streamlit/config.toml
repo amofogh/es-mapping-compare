@@ -1,0 +1,7 @@
+[client]
+# Hide developer menu (Clear cache / Rerun) so the "C" hotkey does not
+# clear Streamlit cache — Ctrl+C / copy can work normally in the browser.
+toolbarMode = "viewer"
+
+[browser]
+gatherUsageStats = false
