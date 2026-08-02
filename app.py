@@ -11,7 +11,6 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 import yaml
 
 from compare_es_mappings import (
@@ -57,48 +56,6 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
-# UI theme toggle (dark by default). Syncs Streamlit's native theme so
-# dataframes / selects / date inputs actually retheme (canvas + BaseWeb).
-if "ui_theme" not in st.session_state:
-    # Prefer URL ?theme= when present (survives full reload).
-    _qp_theme = str(st.query_params.get("theme", "") or "").lower()
-    st.session_state.ui_theme = (
-        _qp_theme if _qp_theme in {"dark", "light"} else "dark"
-    )
-
-_UI_THEME = st.session_state.ui_theme
-_IS_DARK = _UI_THEME == "dark"
-_NATIVE_THEME_NAME = "Dark" if _IS_DARK else "Light"
-
-# Keep query param in sync for reload persistence.
-if st.query_params.get("theme") != _UI_THEME:
-    st.query_params["theme"] = _UI_THEME
-
-# Apply Streamlit native theme via localStorage (Light/Dark), then reload once.
-components.html(
-    f"""
-    <script>
-    (function () {{
-      const desired = {_NATIVE_THEME_NAME!r};
-      const path = window.parent.location.pathname;
-      const key = `stActiveTheme-${{path}}-v2`;
-      let current = null;
-      try {{
-        const raw = window.parent.localStorage.getItem(key);
-        current = raw ? JSON.parse(raw) : null;
-      }} catch (e) {{
-        current = null;
-      }}
-      if (current !== desired) {{
-        window.parent.localStorage.setItem(key, JSON.stringify(desired));
-        window.parent.location.reload();
-      }}
-    }})();
-    </script>
-    """,
-    height=0,
-)
-
 st.markdown(
     """
     <style>
@@ -117,10 +74,10 @@ st.markdown(
         margin-bottom: 0.35rem !important;
     }
 
-    /* Metrics — subtle cards on top of Streamlit theme surfaces */
+    /* Metrics — subtle cards on dark surfaces */
     div[data-testid="stMetric"] {
-        background-color: var(--secondary-background-color, rgba(125, 125, 125, 0.06));
-        border: 1px solid rgba(125, 125, 125, 0.22);
+        background-color: var(--secondary-background-color, #1e293b);
+        border: 1px solid rgba(148, 163, 184, 0.22);
         border-radius: 12px;
         padding: 1rem;
         height: 100%;
@@ -159,7 +116,7 @@ st.markdown(
 
     .stTabs [data-baseweb="tab-list"] {
         gap: 0.35rem;
-        border-bottom: 1px solid rgba(125, 125, 125, 0.22);
+        border-bottom: 1px solid rgba(148, 163, 184, 0.22);
         flex-wrap: wrap;
     }
 
@@ -172,13 +129,13 @@ st.markdown(
     div[data-testid="stRadio"] > div {
         flex-wrap: wrap;
         gap: 0.35rem;
-        border-bottom: 1px solid rgba(125, 125, 125, 0.22);
+        border-bottom: 1px solid rgba(148, 163, 184, 0.22);
         padding-bottom: 0.45rem;
         margin-bottom: 0.65rem;
     }
     div[data-testid="stRadio"] label {
-        background-color: var(--secondary-background-color, rgba(125, 125, 125, 0.06));
-        border: 1px solid rgba(125, 125, 125, 0.22);
+        background-color: var(--secondary-background-color, #1e293b);
+        border: 1px solid rgba(148, 163, 184, 0.22);
         border-radius: 8px 8px 0 0;
         padding: 0.4rem 0.75rem !important;
         font-weight: 600;
@@ -188,7 +145,6 @@ st.markdown(
     div[data-testid="stAlert"] {
         border-radius: 10px;
     }
-    /* Readable text on yellow warning / red error tints */
     div[data-testid="stAlert"] [data-testid="stMarkdownContainer"],
     div[data-testid="stAlert"] [data-testid="stMarkdownContainer] * {
         color: #1e293b !important;
@@ -196,8 +152,8 @@ st.markdown(
 
     .efk-status-bar,
     .efk-info-card {
-        background-color: var(--secondary-background-color, rgba(125, 125, 125, 0.06));
-        border: 1px solid rgba(125, 125, 125, 0.22);
+        background-color: var(--secondary-background-color, #1e293b);
+        border: 1px solid rgba(148, 163, 184, 0.22);
         color: inherit;
         border-radius: 10px;
     }
@@ -223,7 +179,7 @@ st.markdown(
     .efk-status-bar code,
     .efk-days-found code,
     .efk-info-card code {
-        background-color: rgba(125, 125, 125, 0.15);
+        background-color: rgba(148, 163, 184, 0.15);
         color: inherit;
         padding: 0.1rem 0.35rem;
         border-radius: 4px;
@@ -240,7 +196,7 @@ st.markdown(
     }
 
     div[data-testid="stExpander"] {
-        border: 1px solid rgba(125, 125, 125, 0.22);
+        border: 1px solid rgba(148, 163, 184, 0.22);
         border-radius: 10px;
     }
 
@@ -278,16 +234,25 @@ st.markdown(
         margin: 0;
     }
 
-    div[data-testid="stHorizontalBlock"] button[kind="primary"] {
+    /* Muted professional primary actions (no bright cyan) */
+    div[data-testid="stHorizontalBlock"] button[kind="primary"],
+    button[kind="primary"],
+    button[data-testid="baseButton-primary"] {
         min-height: 2.6rem;
         font-weight: 600;
+        background-color: #2563eb !important;
+        border: 1px solid #1d4ed8 !important;
+        color: #f8fafc !important;
     }
-
-    .efk-theme-row {
-        display: flex;
-        justify-content: flex-end;
-        align-items: center;
-        padding-top: 0.55rem;
+    div[data-testid="stHorizontalBlock"] button[kind="primary"]:hover,
+    button[kind="primary"]:hover,
+    button[data-testid="baseButton-primary"]:hover {
+        background-color: #1d4ed8 !important;
+        border-color: #1e40af !important;
+    }
+    div[data-testid="stHorizontalBlock"] button[kind="primary"]:focus,
+    button[kind="primary"]:focus {
+        box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.35) !important;
     }
     </style>
     """,
@@ -904,7 +869,15 @@ def _diff_readiness(baseline: pd.DataFrame, current: pd.DataFrame) -> pd.DataFra
     out.loc[unchanged, "change"] = "unchanged"
     change_order = {"added": 0, "removed": 1, "changed": 2, "unchanged": 3}
     out["_ord"] = out["change"].map(change_order).fillna(9)
-    return out.sort_values(by=["_ord", "project_prefix"]).drop(columns=["_ord"])
+    out = out.sort_values(by=["_ord", "project_prefix"]).drop(columns=["_ord"])
+    return out.rename(
+        columns={
+            "size_baseline": "Index Size (Baseline)",
+            "size_current": "Index Size (Current)",
+            "avg_doc_baseline": "Avg Log Size (Baseline)",
+            "avg_doc_current": "Avg Log Size (Current)",
+        }
+    )
 
 
 def _render_list_table(title: str, items: list[Any], empty: str) -> None:
@@ -939,22 +912,7 @@ elif cached_days:
 elif es_days:
     default_day = date_cls.fromisoformat(es_days[0])
 
-title_col, theme_col = st.columns([8, 1.4], gap="small")
-with title_col:
-    st.title("🔎 EFK Schema Analyzer")
-with theme_col:
-    st.markdown('<div class="efk-theme-row"></div>', unsafe_allow_html=True)
-    toggle_label = "☀️ Light mode" if _IS_DARK else "🌙 Dark mode"
-    if st.button(
-        toggle_label,
-        key="ui_theme_toggle",
-        width="stretch",
-        help="Switch Streamlit Light/Dark theme (tables & inputs included). Default is dark.",
-    ):
-        new_theme = "light" if _IS_DARK else "dark"
-        st.session_state.ui_theme = new_theme
-        st.query_params["theme"] = new_theme
-        st.rerun()
+st.title("🔎 EFK Schema Analyzer")
 
 team_options = ["All"] + load_team_options()
 
@@ -1907,17 +1865,17 @@ elif selected_tab == "📉 Compare days":
                         f"Docs ({selected_day})", format="%d"
                     ),
                     "docs_Δ": st.column_config.NumberColumn("Docs Δ", format="%+d"),
-                    "size_baseline": st.column_config.TextColumn(
-                        f"Size ({baseline_day})"
+                    "Index Size (Baseline)": st.column_config.TextColumn(
+                        "Total Index Size (Baseline)"
                     ),
-                    "size_current": st.column_config.TextColumn(
-                        f"Size ({selected_day})"
+                    "Index Size (Current)": st.column_config.TextColumn(
+                        "Total Index Size (Current)"
                     ),
-                    "avg_doc_baseline": st.column_config.TextColumn(
-                        f"Avg Doc ({baseline_day})"
+                    "Avg Log Size (Baseline)": st.column_config.TextColumn(
+                        "Avg Size per Log Row (Baseline)"
                     ),
-                    "avg_doc_current": st.column_config.TextColumn(
-                        f"Avg Doc ({selected_day})"
+                    "Avg Log Size (Current)": st.column_config.TextColumn(
+                        "Avg Size per Log Row (Current)"
                     ),
                 },
             )

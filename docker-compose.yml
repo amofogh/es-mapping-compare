@@ -21,7 +21,8 @@ x-app: &app
     - ./results:/app/results
     - ./prefixes.json:/app/prefixes.json
     - ./.env:/app/.env:ro
-  # Reach internal Elasticsearch hostnames like on the host (Linux).
+  # Host network: reach Elasticsearch and expose the panel without
+  # broken docker-proxy / bridge DNAT on this host.
   network_mode: host
   entrypoint: ["/docker-entrypoint.sh"]
 
@@ -45,7 +46,6 @@ services:
   panel:
     <<: *app
     container_name: efk-schema-panel
-    # profiles: ["panel"]
     restart: unless-stopped
     command: ["panel"]
     environment:
