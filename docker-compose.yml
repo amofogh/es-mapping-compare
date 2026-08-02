@@ -49,7 +49,7 @@ services:
     restart: unless-stopped
     command: ["panel"]
     environment:
-      STREAMLIT_SERVER_PORT: "8501"
+      STREAMLIT_SERVER_PORT: "8080"
       STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
       STREAMLIT_BROWSER_GATHERUSAGESTATS: "false"
       STREAMLIT_SERVER_HEADLESS: "true"

@@ -56,150 +56,202 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
-st.markdown(
-    """
-    <style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
+# UI theme toggle (dark by default). Component CSS uses theme tokens — not fixed slate hex.
+if "ui_theme" not in st.session_state:
+    st.session_state.ui_theme = "dark"
 
-    .block-container {
+_UI_THEME = st.session_state.ui_theme
+_IS_DARK = _UI_THEME == "dark"
+
+# Remap Streamlit-compatible tokens so light/dark both stay readable.
+_THEME_TOKEN_CSS = (
+    """
+    .stApp {
+      --background-color: #0b1220;
+      --secondary-background-color: #1e293b;
+      --background-secondary-color: #1e293b;
+      --text-color: #e2e8f0;
+      --text-color-subtle: #94a3b8;
+      --border-color: rgba(148, 163, 184, 0.28);
+      color-scheme: dark;
+    }
+    """
+    if _IS_DARK
+    else """
+    .stApp {
+      --background-color: #ffffff;
+      --secondary-background-color: #f0f2f6;
+      --background-secondary-color: #f0f2f6;
+      --text-color: #31333f;
+      --text-color-subtle: #64748b;
+      --border-color: rgba(49, 51, 63, 0.2);
+      color-scheme: light;
+    }
+    """
+)
+
+st.markdown(
+    f"""
+    <style>
+    {_THEME_TOKEN_CSS}
+
+    #MainMenu {{visibility: hidden;}}
+    footer {{visibility: hidden;}}
+    header {{visibility: hidden;}}
+
+    .stApp {{
+        background-color: var(--background-color);
+        color: var(--text-color);
+    }}
+
+    .block-container {{
         padding-top: 1.25rem;
         padding-bottom: 2rem;
         max-width: 1480px;
-    }
+    }}
 
-    h1 {
+    h1 {{
         letter-spacing: -0.02em;
         margin-bottom: 0.35rem !important;
-    }
+        color: var(--text-color, inherit) !important;
+    }}
 
-    div[data-testid="stMetric"] {
-        background: linear-gradient(145deg, #0f172a 0%, #1e293b 100%);
-        border: 1px solid #334155;
+    /* Metrics — theme-relative surfaces (no hardcoded slate) */
+    div[data-testid="stMetric"] {{
+        background-color: var(--background-secondary-color, rgba(125, 125, 125, 0.05));
+        border: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
         border-radius: 12px;
-        padding: 1rem 1.1rem;
-        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.25);
+        padding: 1rem;
         height: 100%;
         min-height: 110px;
         display: flex;
         flex-direction: column;
         justify-content: center;
         box-sizing: border-box;
-    }
+    }}
 
-    /* Equal-width KPI columns */
-    div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) {
+    div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) {{
         align-items: stretch;
-    }
+    }}
 
     div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"])
-      > div[data-testid="stColumn"] {
+      > div[data-testid="stColumn"] {{
         flex: 1 1 0 !important;
         width: 0 !important;
         min-width: 0 !important;
-    }
+    }}
 
-    div[data-testid="stMetric"] label {
-        color: #94a3b8 !important;
+    div[data-testid="stMetric"] label {{
+        color: var(--text-color-subtle, inherit) !important;
+        opacity: 0.8;
         min-height: 2.4rem;
         display: flex;
         align-items: flex-end;
         line-height: 1.2;
-    }
+    }}
 
-    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
-        color: #f8fafc !important;
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
+        color: var(--text-color, inherit) !important;
         font-weight: 700;
         font-size: 1.75rem !important;
-    }
+    }}
 
-    .stTabs [data-baseweb="tab-list"] {
+    .stTabs [data-baseweb="tab-list"] {{
         gap: 0.35rem;
-        border-bottom: 1px solid #334155;
+        border-bottom: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
         flex-wrap: wrap;
-    }
+    }}
 
-    .stTabs [data-baseweb="tab"] {
+    .stTabs [data-baseweb="tab"] {{
         border-radius: 8px 8px 0 0;
         padding: 0.55rem 0.9rem;
         font-weight: 600;
-    }
+    }}
 
-    /* Session-state tab bar (st.radio horizontal) */
-    div[data-testid="stRadio"] > div {
+    /* Tab bar (st.radio) — adaptive, no dark fill overrides on inputs */
+    div[data-testid="stRadio"] > div {{
         flex-wrap: wrap;
         gap: 0.35rem;
-        border-bottom: 1px solid #334155;
+        border-bottom: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
         padding-bottom: 0.45rem;
         margin-bottom: 0.65rem;
-    }
-    div[data-testid="stRadio"] label {
-        background: #1e293b;
-        border: 1px solid #334155;
+    }}
+    div[data-testid="stRadio"] label {{
+        background-color: var(--background-secondary-color, rgba(125, 125, 125, 0.05));
+        border: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
         border-radius: 8px 8px 0 0;
         padding: 0.4rem 0.75rem !important;
         font-weight: 600;
-    }
+        color: var(--text-color, inherit) !important;
+    }}
 
-    .stAlert { border-radius: 10px; }
+    /* Alerts: readable text on yellow/red tints in light mode */
+    .stAlert,
+    div[data-testid="stAlert"] {{
+        border-radius: 10px;
+    }}
+    div[data-testid="stAlert"] [data-testid="stMarkdownContainer"],
+    div[data-testid="stAlert"] [data-testid="stMarkdownContainer"] p,
+    div[data-testid="stAlert"] [data-testid="stMarkdownContainer"] span,
+    div[data-testid="stAlert"] [data-testid="stMarkdownContainer"] strong,
+    div[data-testid="stAlert"] [data-testid="stMarkdownContainer"] code {{
+        color: #1e293b !important;
+    }}
 
-    /* Sleek dashboard status bar — two scannable metric rows */
-    .efk-status-bar {
+    /* Status / info cards — adaptive surfaces */
+    .efk-status-bar,
+    .efk-info-card {{
+        background-color: var(--background-secondary-color, rgba(125, 125, 125, 0.05));
+        border: 1px solid rgba(125, 125, 125, 0.2);
+        color: var(--text-color, inherit);
+        border-radius: 10px;
+    }}
+    .efk-status-bar {{
         display: flex;
         flex-direction: column;
         gap: 0.45rem;
-        background: #0f172a;
-        border: 1px solid #1e293b;
-        color: #cbd5e1;
-        border-radius: 10px;
         padding: 0.75rem 1rem;
         margin: 0.35rem 0 0.85rem 0;
         font-size: 0.92rem;
         line-height: 1.5;
-    }
-    .efk-status-bar .efk-status-row {
+    }}
+    .efk-status-bar .efk-status-row {{
         display: flex;
         flex-wrap: wrap;
         align-items: center;
         gap: 0.3rem 0.65rem;
-    }
-    .efk-status-bar .efk-status-sep {
-        color: #475569;
+    }}
+    .efk-status-bar .efk-status-sep {{
+        color: var(--text-color-subtle, inherit);
+        opacity: 0.7;
         user-select: none;
-    }
-    .efk-status-bar code {
-        color: #e2e8f0;
-        background: #1e293b;
+    }}
+    .efk-status-bar code,
+    .efk-days-found code,
+    .efk-info-card code {{
+        background-color: rgba(125, 125, 125, 0.15);
+        color: var(--text-color, inherit);
         padding: 0.1rem 0.35rem;
         border-radius: 4px;
-    }
+    }}
 
-    /* Days-found caption block */
-    .efk-days-found {
-        color: #94a3b8;
+    .efk-days-found {{
+        color: var(--text-color-subtle, inherit);
         font-size: 0.88rem;
         line-height: 1.55;
         margin: 0.15rem 0 0.55rem 0;
-    }
-    .efk-days-found div + div {
+    }}
+    .efk-days-found div + div {{
         margin-top: 0.2rem;
-    }
-    .efk-days-found code {
-        color: #cbd5e1;
-        background: #1e293b;
-        padding: 0.05rem 0.3rem;
-        border-radius: 4px;
-        font-size: 0.84rem;
-    }
+    }}
 
-    div[data-testid="stExpander"] {
-        border: 1px solid #334155;
+    div[data-testid="stExpander"] {{
+        border: 1px solid var(--border-color, rgba(125, 125, 125, 0.2));
         border-radius: 10px;
-        background: #0f172a;
-    }
+        background-color: var(--background-secondary-color, rgba(125, 125, 125, 0.05));
+    }}
 
-    .conflict-banner {
+    .conflict-banner {{
         background: linear-gradient(90deg, #7f1d1d 0%, #991b1b 55%, #b45309 100%);
         color: #fff7ed;
         padding: 0.85rem 1.1rem;
@@ -207,42 +259,45 @@ st.markdown(
         font-weight: 600;
         margin-bottom: 0.75rem;
         border: 1px solid #fca5a5;
-    }
+    }}
 
-    .efk-info-card {
-        background: linear-gradient(145deg, #0f172a 0%, #1e293b 100%);
-        border: 1px solid #334155;
-        border-radius: 12px;
+    .efk-info-card {{
         padding: 1.15rem 1.35rem;
         margin: 0.35rem 0 1.1rem 0;
-        color: #e2e8f0;
         line-height: 1.55;
-    }
-    .efk-info-card h3 {
+        border-radius: 12px;
+    }}
+    .efk-info-card h3 {{
         margin: 0 0 0.75rem 0;
-        color: #f8fafc;
+        color: var(--text-color, inherit);
         font-size: 1.15rem;
-    }
-    .efk-info-card dl {
+    }}
+    .efk-info-card dl {{
         margin: 0;
         display: grid;
         grid-template-columns: minmax(140px, 200px) 1fr;
         gap: 0.45rem 1rem;
-    }
-    .efk-info-card dt {
-        color: #94a3b8;
+    }}
+    .efk-info-card dt {{
+        color: var(--text-color-subtle, inherit);
         font-weight: 600;
-    }
-    .efk-info-card dd {
+    }}
+    .efk-info-card dd {{
         margin: 0;
-        color: #f1f5f9;
-    }
+        color: var(--text-color, inherit);
+    }}
 
-    /* Align action-row primary button height */
-    div[data-testid="stHorizontalBlock"] button[kind="primary"] {
+    div[data-testid="stHorizontalBlock"] button[kind="primary"] {{
         min-height: 2.6rem;
         font-weight: 600;
-    }
+    }}
+
+    .efk-theme-row {{
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+        padding-top: 0.55rem;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -893,7 +948,20 @@ elif cached_days:
 elif es_days:
     default_day = date_cls.fromisoformat(es_days[0])
 
-st.title("🔎 EFK Schema Analyzer")
+title_col, theme_col = st.columns([8, 1.4], gap="small")
+with title_col:
+    st.title("🔎 EFK Schema Analyzer")
+with theme_col:
+    st.markdown('<div class="efk-theme-row"></div>', unsafe_allow_html=True)
+    toggle_label = "☀️ Light mode" if _IS_DARK else "🌙 Dark mode"
+    if st.button(
+        toggle_label,
+        key="ui_theme_toggle",
+        width="stretch",
+        help="Switch dashboard colors. Default is dark mode.",
+    ):
+        st.session_state.ui_theme = "light" if _IS_DARK else "dark"
+        st.rerun()
 
 team_options = ["All"] + load_team_options()
 

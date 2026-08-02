@@ -13,7 +13,7 @@ python discover_prefixes.py
 # pin a calendar day of daily indices (YYYY-MM-DD):
 INDEX_DATE=2026-07-28 python compare_es_mappings.py
 
-docker compose --profile panel up -d --build panel   # http://localhost:8501
+docker compose --profile panel up -d --build panel   # http://localhost:8080
 ```
 
 In the panel: pick an **Index day** → **Fetch from Elasticsearch** (loads that day's `*-YYYY.MM.DD` indices). Use ES API port **9200**.
