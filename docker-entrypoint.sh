@@ -73,6 +73,16 @@ case "$mode" in
     ls -la /app/results | head -20 || true
     exit "$code"
     ;;
+  panel|dashboard|streamlit)
+    port="${STREAMLIT_SERVER_PORT:-8501}"
+    echo "==> Starting EFK Schema Migration panel on 0.0.0.0:${port}"
+    echo "    Open http://localhost:${port}"
+    exec streamlit run app.py \
+      --server.port="${port}" \
+      --server.address=0.0.0.0 \
+      --server.headless=true \
+      --browser.gatherUsageStats=false
+    ;;
   *)
     if [ "$mode" = "fix-perms" ]; then
       echo "==> Fixing ownership/permissions on bind mounts..."
@@ -92,7 +102,7 @@ case "$mode" in
       echo "fix-perms must run as root in the container" >&2
       exit 1
     fi
-    echo "Usage: $0 {discover|compare|all|fix-perms}" >&2
+    echo "Usage: $0 {discover|compare|all|panel|fix-perms}" >&2
     exit 1
     ;;
 esac
