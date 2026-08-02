@@ -47,7 +47,7 @@ services:
   panel:
     <<: *app
     container_name: efk-schema-panel
-    profiles: ["panel"]
+    # profiles: ["panel"]
     restart: unless-stopped
     command: ["panel"]
     environment:
