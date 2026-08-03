@@ -13,7 +13,18 @@ python discover_prefixes.py
 # pin a calendar day of daily indices (YYYY-MM-DD):
 INDEX_DATE=2026-07-28 python compare_es_mappings.py
 
-docker compose --profile panel up -d --build panel   # http://localhost:8080
+docker compose up -d --build panel   # http://localhost:${PANEL_PORT:-8080}
+```
+
+Set `PANEL_PORT` in `.env` to change the **host** published port (maps to container port `8080`).
+
+Compose uses **bridge networking** (no `network_mode: host`). If the container is healthy but the browser cannot open the panel, Docker FORWARD rules on the host may be blocking published ports. As root:
+
+```bash
+sudo iptables -I DOCKER-USER -j RETURN
+sudo iptables -P FORWARD ACCEPT
+docker compose up -d --force-recreate panel
+curl -m 3 -I http://127.0.0.1:${PANEL_PORT:-8080}
 ```
 
 In the panel: pick an **Index day** → **Fetch from Elasticsearch** (loads that day's `*-YYYY.MM.DD` indices). Use ES API port **9200**.

@@ -21,8 +21,8 @@ x-app: &app
     - ./results:/app/results
     - ./prefixes.json:/app/prefixes.json
     - ./.env:/app/.env:ro
-  # Host network: reach Elasticsearch and expose the panel without
-  # broken docker-proxy / bridge DNAT on this host.
+  # Required on this host: bridge port-publish times out (firewall/FORWARD).
+  # Host network lets Streamlit bind PANEL_PORT directly and reach ES.
   network_mode: host
   entrypoint: ["/docker-entrypoint.sh"]
 
@@ -49,7 +49,8 @@ services:
     restart: unless-stopped
     command: ["panel"]
     environment:
-      STREAMLIT_SERVER_PORT: "8080"
+      PANEL_PORT: ${PANEL_PORT:-8080}
+      STREAMLIT_SERVER_PORT: ${PANEL_PORT:-8080}
       STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
       STREAMLIT_BROWSER_GATHERUSAGESTATS: "false"
       STREAMLIT_SERVER_HEADLESS: "true"

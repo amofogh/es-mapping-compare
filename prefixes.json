@@ -87,6 +87,7 @@
     "hrm-deposit-provider-resalat",
     "hrm-deposit-switch-middleeast",
     "hrm-directdebit-agent",
+    "hrm-directdebit-customer",
     "hrm-directdebit-gateway",
     "hrm-directfund-agent",
     "hrm-directfund-gateway",

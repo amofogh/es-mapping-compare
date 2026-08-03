@@ -5,6 +5,9 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# ENV PIP_INDEX_URL=https://repo.asax.ir/repository/pypi-group1/simple \
+#     PIP_TRUSTED_HOST=repo.asax.ir
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

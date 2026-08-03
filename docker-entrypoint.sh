@@ -74,9 +74,9 @@ case "$mode" in
     exit "$code"
     ;;
   panel|dashboard|streamlit)
-    port="${STREAMLIT_SERVER_PORT:-8080}"
+    port="${STREAMLIT_SERVER_PORT:-${PANEL_PORT:-8080}}"
     echo "==> Starting EFK Schema Migration panel on 0.0.0.0:${port}"
-    echo "    Open http://localhost:${port}"
+    echo "    Open http://localhost:${port}  (set PANEL_PORT in .env to change)"
     exec streamlit run app.py \
       --server.port="${port}" \
       --server.address=0.0.0.0 \
